@@ -160,7 +160,7 @@ export class SalesService {
       }
 
       // C. Payment Breakdown Handling & Primary Provider Determination
-      let derivedPaymentProvider = PaymentProvider.CASH;
+      let derivedPaymentProvider = PaymentProvider.MPESA;
       let derivedMpesaRef: string | null = null;
       const paymentRecords: any[] = [];
 
