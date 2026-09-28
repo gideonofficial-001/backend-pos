@@ -159,38 +159,40 @@ export class SalesService {
         });
       }
 
-      // C. Payment Breakdown Handling & Primary Provider Determination
-      let derivedPaymentProvider = PaymentProvider.MPESA;
-      let derivedMpesaRef: string | null = null;
-      const paymentRecords: any[] = [];
+        // C. Payment Breakdown Handling & Primary Provider Determination
+let derivedMpesaRef: string | null = null;
+const paymentRecords: any[] = [];
 
-      if (payments && payments.length > 0) {
-        let hasMpesa = false;
-        let hasCash = false;
-        for (const p of payments) {
-          if (p.method === PaymentProvider.MPESA && p.amount > 0) {
-            hasMpesa = true;
-            if (p.mpesaRef) derivedMpesaRef = p.mpesaRef;
-          }
-          if (p.method === PaymentProvider.CASH && p.amount > 0) {
-            hasCash = true;
-          }
-          paymentRecords.push({
-            method: p.method,
-            amount: p.amount,
-            mpesaRef: p.mpesaRef || null,
-          });
-        }
-        if (hasMpesa && !hasCash) derivedPaymentProvider = PaymentProvider.MPESA;
-        else if (hasMpesa && hasCash) derivedPaymentProvider = PaymentProvider.MPESA;
-        else if (!hasMpesa && hasCash) derivedPaymentProvider = PaymentProvider.CASH;
-      } else {
-        paymentRecords.push({
-          method: PaymentProvider.CASH,
-          amount: total,
-        });
+let hasMpesa = false;
+
+if (payments && payments.length > 0) {
+  for (const p of payments) {
+    if (p.method === PaymentProvider.MPESA && p.amount > 0) {
+      hasMpesa = true;
+
+      if (p.mpesaRef) {
+        derivedMpesaRef = p.mpesaRef;
       }
+    }
 
+    paymentRecords.push({
+      method: p.method,
+      amount: p.amount,
+      mpesaRef: p.mpesaRef || null,
+    });
+  }
+} else {
+  paymentRecords.push({
+    method: PaymentProvider.CASH,
+    amount: total,
+  });
+}
+
+// Determine provider after the payment loop.
+// M-Pesa takes precedence for mixed Cash + M-Pesa payments.
+const derivedPaymentProvider: PaymentProvider =
+  hasMpesa ? PaymentProvider.MPESA : PaymentProvider.CASH;
+      
       // D. Create Sale Record
       const newSale = await tx.sale.create({
         data: {
