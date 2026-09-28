@@ -1,0 +1,718 @@
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  ForbiddenException,
+} from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { CreateTransferDto } from './dto/create-transfer.dto';
+import { TransferStatus, TransferItemStatus, MovementType, UserRole, LpgComponent } from '@prisma/client';
+
+interface AuthUser {
+  userId: string;
+  role: UserRole;
+  branchId?: string;
+}
+
+// 🚀 FIXED: Better labels for internal activity feeds and notifications
+function itemLabel(item: any): string {
+  const isLpg = item.product?.isCylinderTracked || item.product?.isLpg;
+  if (isLpg) {
+    if (item.lpgComponent === 'REFILL') return `${item.product.name} (Gas Refill) x${item.quantity}`;
+    if (item.lpgComponent === 'CYLINDER') return `${item.product.name} (Complete Set) x${item.quantity}`;
+    return `${item.product.name} (Empty Shell) x${item.quantity}`;
+  }
+  return `${item.product.name} x${item.quantity}`;
+}
+
+function buildItemsSummary(items: any[]): string {
+  return items.map(itemLabel).join(', ');
+}
+
+@Injectable()
+export class TransfersService {
+  constructor(
+    private prisma: PrismaService,
+    private notificationsService: NotificationsService,
+  ) {}
+
+  async create(data: CreateTransferDto, user: AuthUser) {
+    const fromBranchId = data.fromBranchId || user.branchId;
+    const toBranchId = data.toBranchId;
+    const { items, notes } = data;
+
+    if (!fromBranchId) throw new BadRequestException('Source branch ID is required');
+    if (!items || items.length === 0) throw new BadRequestException('At least one product must be included');
+    if (fromBranchId === toBranchId) throw new BadRequestException('Source and destination branches cannot be the same');
+    
+    if (user.role === UserRole.BRANCH_MANAGER && user.branchId !== fromBranchId) {
+      throw new ForbiddenException('You can only transfer from your assigned branch');
+    }
+
+    const [sourceBranch, destBranch] = await Promise.all([
+      this.prisma.branch.findUnique({ where: { id: fromBranchId } }),
+      this.prisma.branch.findUnique({ where: { id: toBranchId } }),
+    ]);
+
+    if (!sourceBranch) throw new NotFoundException('Source branch not found');
+    if (!destBranch) throw new NotFoundException('Destination branch not found');
+    if (!destBranch.isActive) throw new BadRequestException(`${destBranch.name} is inactive and cannot receive transfers`);
+
+    const transferItems: { productId: string; quantity: number; lpgComponent?: LpgComponent }[] = [];
+
+    for (const item of items) {
+      if (!item.quantity || item.quantity <= 0)
+        throw new BadRequestException('Quantity must be greater than 0 for every item');
+
+      const inventory = await this.prisma.inventory.findUnique({
+        where: { branchId_productId: { branchId: fromBranchId, productId: item.productId } },
+        include: { product: true },
+      });
+
+      if (!inventory) throw new BadRequestException(`Product not found in source branch inventory`);
+
+      const variant = item.variant ?? 'STANDARD';
+      const isLpg = inventory.product.isCylinderTracked || inventory.product.isLpg;
+      let lpgComponent: LpgComponent | undefined = undefined;
+
+      if (isLpg) {
+        if (variant === 'CYLINDER') {
+          const available = inventory.fullCylinders ?? 0;
+          if (available < item.quantity) throw new BadRequestException(`Insufficient full cylinders. Available: ${available}`);
+          lpgComponent = LpgComponent.CYLINDER;
+        } else if (variant === 'REFILL') {
+          const available = inventory.fullCylinders ?? 0;
+          if (available < item.quantity) throw new BadRequestException(`Insufficient gas refills. Available: ${available}`);
+          lpgComponent = LpgComponent.REFILL;
+        } else if (variant === 'EMPTY_SHELL') {
+          const empties = (inventory.quantity || 0) - (inventory.fullCylinders ?? 0);
+          if (empties < item.quantity) throw new BadRequestException(`Insufficient empty shells. Available: ${empties}`);
+        }
+      } else {
+        if (inventory.quantity < item.quantity) {
+          throw new BadRequestException(`Insufficient stock. Available: ${inventory.quantity}`);
+        }
+      }
+
+      transferItems.push({
+        productId: item.productId,
+        quantity: item.quantity,
+        ...(lpgComponent && { lpgComponent }),
+      });
+    }
+
+    const count = await this.prisma.transfer.count();
+    const transferCode = `TRF-${String(count + 1).padStart(5, '0')}`;
+
+    const transfer = await this.prisma.transfer.create({
+      data: {
+        transferCode,
+        fromBranchId,
+        toBranchId,
+        requestedById: user.userId,
+        status: TransferStatus.PENDING,
+        notes,
+        items: { create: transferItems },
+      },
+      include: {
+        fromBranch: { select: { id: true, name: true, code: true } },
+        toBranch:   { select: { id: true, name: true, code: true } },
+        requestedBy: { select: { id: true, firstName: true, lastName: true } },
+        items: { include: { product: true } },
+      },
+    });
+
+    if (destBranch.managerId) {
+      await this.notificationsService.create({
+        type: 'TRANSFER_REQUEST',
+        title: 'New Transfer Request',
+        message: `${transfer.fromBranch.name} wants to send you: ${buildItemsSummary(transfer.items)}`,
+        userId: destBranch.managerId,
+        entityId: transfer.id,
+        entityType: 'Transfer',
+      });
+    }
+
+    await this.prisma.activityFeed.create({
+      data: {
+        type: 'TRANSFER_CREATED',
+        branchId: fromBranchId,
+        title: 'Transfer Requested',
+        message: `Transfer from ${transfer.fromBranch.name} to ${transfer.toBranch.name}: ${buildItemsSummary(transfer.items)}`,
+        entityId: transfer.id,
+        entityType: 'Transfer',
+        visibleToBranch: true,
+      },
+    });
+
+    return transfer;
+  }
+
+  async findAll(userId: string, query?: any) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { role: true, branchId: true },
+    });
+
+    if (!user) throw new NotFoundException('User not found');
+
+    const where: any = {};
+    if (user.branchId) {
+      if (query?.direction === 'INCOMING') {
+        where.toBranchId = user.branchId;
+      } else if (query?.direction === 'OUTGOING') {
+        where.fromBranchId = user.branchId;
+      } else {
+        where.OR = [
+          { fromBranchId: user.branchId },
+          { toBranchId: user.branchId },
+        ];
+      }
+    }
+
+    if (query?.status) {
+      where.status = query.status;
+    }
+
+    if (query?.branchId && query.branchId !== 'all') {
+      where.OR = [
+        { fromBranchId: query.branchId },
+        { toBranchId: query.branchId },
+      ];
+    }
+
+    if (query?.date) {
+      const startOfDay = new Date(query.date);
+      startOfDay.setHours(0, 0, 0, 0);
+      const endOfDay = new Date(query.date);
+      endOfDay.setHours(23, 59, 59, 999);
+      where.createdAt = {
+        gte: startOfDay,
+        lte: endOfDay,
+      };
+    }
+
+    const findOptions: any = {
+      where,
+      include: {
+        fromBranch:  { select: { id: true, name: true } },
+        toBranch:    { select: { id: true, name: true } },
+        requestedBy: { select: { id: true, firstName: true, lastName: true } },
+        items: {
+          include: { product: true },
+          orderBy: { createdAt: 'asc' },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    };
+
+    if (query?.limit) {
+      const limit = parseInt(query.limit, 10);
+      if (!isNaN(limit) && limit > 0) {
+        findOptions.take = limit;
+        if (query?.page) {
+          const page = parseInt(query.page, 10);
+          if (!isNaN(page) && page > 0) {
+            findOptions.skip = (page - 1) * limit;
+          }
+        }
+      }
+    }
+
+    return this.prisma.transfer.findMany(findOptions);
+  }
+
+  async findOne(id: string) {
+    const transfer = await this.prisma.transfer.findUnique({
+      where: { id },
+      include: {
+        fromBranch:  true,
+        toBranch:    true,
+        requestedBy: { select: { id: true, firstName: true, lastName: true } },
+        items: {
+          include: { product: true },
+          orderBy: { createdAt: 'asc' },
+        },
+      },
+    });
+    if (!transfer) throw new NotFoundException('Transfer not found');
+    return transfer;
+  }
+
+  private async applyItemStockMovement(tx: any, transfer: any, item: any, performedById: string) {
+    const lpgComponent = item.lpgComponent;
+    const isLpg = item.product?.isCylinderTracked || item.product?.isLpg;
+
+    // ── Deduct from sender ────────────────────────────────────────────────
+    const sourceInv = await tx.inventory.findUnique({
+      where: { branchId_productId: { branchId: transfer.fromBranchId, productId: item.productId } },
+    });
+
+    if (sourceInv) {
+      let updateData: any = {};
+
+      if (isLpg) {
+        if (lpgComponent === LpgComponent.CYLINDER) {
+          updateData.quantity = { decrement: item.quantity };
+          updateData.fullCylinders = { decrement: item.quantity };
+        } else if (lpgComponent === LpgComponent.REFILL) {
+          updateData.fullCylinders = { decrement: item.quantity };
+        } else {
+          updateData.quantity = { decrement: item.quantity };
+        }
+      } else {
+        updateData.quantity = { decrement: item.quantity };
+      }
+
+      await tx.inventory.update({ where: { id: sourceInv.id }, data: updateData });
+      await tx.stockMovement.create({
+        data: {
+          inventoryId: sourceInv.id,
+          type: MovementType.TRANSFER_OUT,
+          quantity: -item.quantity,
+          referenceId: transfer.id,
+          referenceType: 'Transfer',
+          performedById,
+          notes: `Transfer ${transfer.transferCode} out${lpgComponent ? ` (${lpgComponent})` : ''}`,
+        },
+      });
+    }
+
+    // ── Add to receiver ───────────────────────────────────────────────────
+    const destInv = await tx.inventory.findUnique({
+      where: { branchId_productId: { branchId: transfer.toBranchId, productId: item.productId } },
+    });
+
+    if (destInv) {
+      let updateData: any = {};
+
+      if (isLpg) {
+        if (lpgComponent === LpgComponent.CYLINDER) {
+          updateData.quantity = { increment: item.quantity };
+          updateData.fullCylinders = { increment: item.quantity };
+        } else if (lpgComponent === LpgComponent.REFILL) {
+          updateData.fullCylinders = { increment: item.quantity };
+        } else {
+          updateData.quantity = { increment: item.quantity };
+        }
+      } else {
+        updateData.quantity = { increment: item.quantity };
+      }
+
+      await tx.inventory.update({ where: { id: destInv.id }, data: updateData });
+      await tx.stockMovement.create({
+        data: {
+          inventoryId: destInv.id,
+          type: MovementType.TRANSFER_IN,
+          quantity: item.quantity,
+          referenceId: transfer.id,
+          referenceType: 'Transfer',
+          performedById,
+          notes: `Transfer ${transfer.transferCode} in${lpgComponent ? ` (${lpgComponent})` : ''}`,
+        },
+      });
+    } else {
+      const createData: any = { branchId: transfer.toBranchId, productId: item.productId };
+      
+      if (isLpg) {
+        if (lpgComponent === LpgComponent.CYLINDER) {
+          createData.quantity = item.quantity;
+          createData.fullCylinders = item.quantity;
+        } else if (lpgComponent === LpgComponent.REFILL) {
+          createData.quantity = 0;
+          createData.fullCylinders = item.quantity;
+        } else {
+          createData.quantity = item.quantity;
+          createData.fullCylinders = 0;
+        }
+      } else {
+        createData.quantity = item.quantity;
+      }
+      await tx.inventory.create({ data: createData });
+    }
+  }
+
+  private async recomputeTransferStatus(transferId: string): Promise<TransferStatus> {
+    const items = await this.prisma.transferItem.findMany({ where: { transferId } });
+    const allResolved = items.every((i) => i.status !== TransferItemStatus.PENDING);
+    const anyResolved = items.some((i) => i.status !== TransferItemStatus.PENDING);
+
+    const status: TransferStatus = allResolved
+      ? TransferStatus.COMPLETED
+      : anyResolved
+      ? TransferStatus.PARTIAL
+      : TransferStatus.PENDING;
+
+    await this.prisma.transfer.update({ where: { id: transferId }, data: { status } });
+    return status;
+  }
+
+  private assertIsReceivingManager(transfer: { toBranchId: string }, user: AuthUser) {
+    const canRespond =
+      (user.role === UserRole.BRANCH_MANAGER || user.role === UserRole.SUPER_ADMIN || user.role === UserRole.OVERALL_MANAGER) &&
+      (user.role !== UserRole.BRANCH_MANAGER || user.branchId === transfer.toBranchId);
+    
+    if (!canRespond)
+      throw new ForbiddenException('Only the receiving branch manager or an admin can act on this transfer');
+  }
+
+  async approveItem(transferId: string, itemId: string, user: AuthUser) {
+    const transfer = await this.prisma.transfer.findUnique({
+      where: { id: transferId },
+      include: { items: { include: { product: true } } },
+    });
+    if (!transfer) throw new NotFoundException('Transfer not found');
+    this.assertIsReceivingManager(transfer, user);
+
+    const item = transfer.items.find((i) => i.id === itemId);
+    if (!item) throw new NotFoundException('Transfer item not found');
+    if (item.status !== TransferItemStatus.PENDING)
+      throw new BadRequestException(`This item has already been ${item.status.toLowerCase()}`);
+
+    await this.prisma.$transaction(async (tx) => {
+      await this.applyItemStockMovement(tx, transfer, item, user.userId);
+      await tx.transferItem.update({
+        where: { id: itemId },
+        data: { status: TransferItemStatus.ACCEPTED },
+      });
+    });
+
+    await this.recomputeTransferStatus(transferId);
+
+    const fromBranch = await this.prisma.branch.findUnique({ where: { id: transfer.fromBranchId } });
+    if (fromBranch?.managerId) {
+      await this.notificationsService.create({
+        type: 'TRANSFER_RESPONSE',
+        title: 'Transfer Item Accepted',
+        message: `${itemLabel(item)} was accepted`,
+        userId: fromBranch.managerId,
+        entityId: transferId,
+        entityType: 'Transfer',
+      });
+    }
+
+    await this.cancelPendingTransfersWithInsufficientStock(transfer.fromBranchId, [item.productId]);
+
+    return this.findOne(transferId);
+  }
+
+  async rejectItem(transferId: string, itemId: string, user: AuthUser, rejectionReason: string) {
+    if (!rejectionReason?.trim()) throw new BadRequestException('A rejection reason is required');
+
+    const transfer = await this.prisma.transfer.findUnique({
+      where: { id: transferId },
+      include: { items: { include: { product: true } } },
+    });
+    if (!transfer) throw new NotFoundException('Transfer not found');
+    this.assertIsReceivingManager(transfer, user);
+
+    const item = transfer.items.find((i) => i.id === itemId);
+    if (!item) throw new NotFoundException('Transfer item not found');
+    if (item.status !== TransferItemStatus.PENDING)
+      throw new BadRequestException(`This item has already been ${item.status.toLowerCase()}`);
+
+    await this.prisma.transferItem.update({
+      where: { id: itemId },
+      data: { status: TransferItemStatus.REJECTED, notes: rejectionReason.trim() },
+    });
+    await this.recomputeTransferStatus(transferId);
+
+    const fromBranch = await this.prisma.branch.findUnique({ where: { id: transfer.fromBranchId } });
+    if (fromBranch?.managerId) {
+      await this.notificationsService.create({
+        type: 'TRANSFER_RESPONSE',
+        title: 'Transfer Item Rejected',
+        message: `${itemLabel(item)} was rejected. Reason: ${rejectionReason}`,
+        userId: fromBranch.managerId,
+        entityId: transferId,
+        entityType: 'Transfer',
+      });
+    }
+
+    return this.findOne(transferId);
+  }
+
+  async approve(id: string, user: AuthUser) {
+    const transfer = await this.prisma.transfer.findUnique({
+      where: { id },
+      include: { items: { include: { product: true } } },
+    });
+    if (!transfer) throw new NotFoundException('Transfer not found');
+    this.assertIsReceivingManager(transfer, user);
+
+    const pending = transfer.items.filter((i) => i.status === TransferItemStatus.PENDING);
+    if (pending.length === 0) throw new BadRequestException('No pending items left to approve');
+
+    await this.prisma.$transaction(async (tx) => {
+      for (const item of pending) {
+        await this.applyItemStockMovement(tx, transfer, item, user.userId);
+        await tx.transferItem.update({ where: { id: item.id }, data: { status: TransferItemStatus.ACCEPTED } });
+      }
+    });
+
+    await this.recomputeTransferStatus(id);
+
+    const fromBranch = await this.prisma.branch.findUnique({ where: { id: transfer.fromBranchId } });
+    if (fromBranch?.managerId) {
+      await this.notificationsService.create({
+        type: 'TRANSFER_RESPONSE',
+        title: 'Transfer Accepted',
+        message: `All items accepted: ${buildItemsSummary(pending)}`,
+        userId: fromBranch.managerId,
+        entityId: id,
+        entityType: 'Transfer',
+      });
+    }
+
+    await this.cancelPendingTransfersWithInsufficientStock(transfer.fromBranchId, pending.map(i => i.productId));
+
+    return this.findOne(id);
+  }
+
+  async reject(id: string, user: AuthUser, rejectionReason: string) {
+    if (!rejectionReason?.trim()) throw new BadRequestException('A rejection reason is required');
+
+    const transfer = await this.prisma.transfer.findUnique({
+      where: { id },
+      include: { items: { include: { product: true } } },
+    });
+    if (!transfer) throw new NotFoundException('Transfer not found');
+    this.assertIsReceivingManager(transfer, user);
+
+    const pending = transfer.items.filter((i) => i.status === TransferItemStatus.PENDING);
+    if (pending.length === 0) throw new BadRequestException('No pending items left to reject');
+
+    await this.prisma.transferItem.updateMany({
+      where: { id: { in: pending.map((i) => i.id) } },
+      data: { status: TransferItemStatus.REJECTED, notes: rejectionReason.trim() },
+    });
+    await this.recomputeTransferStatus(id);
+
+    const fromBranch = await this.prisma.branch.findUnique({ where: { id: transfer.fromBranchId } });
+    if (fromBranch?.managerId) {
+      await this.notificationsService.create({
+        type: 'TRANSFER_RESPONSE',
+        title: 'Transfer Rejected',
+        message: `Items rejected: ${buildItemsSummary(pending)}. Reason: ${rejectionReason}`,
+        userId: fromBranch.managerId,
+        entityId: id,
+        entityType: 'Transfer',
+      });
+    }
+
+    return this.findOne(id);
+  }
+
+  async cancel(id: string, user: AuthUser) {
+    const transfer = await this.prisma.transfer.findUnique({
+      where: { id },
+      include: {
+        toBranch: { select: { managerId: true } },
+        items:    { include: { product: true } },
+      },
+    });
+    if (!transfer) throw new NotFoundException('Transfer not found');
+
+    if (!transfer.items.every((i) => i.status === TransferItemStatus.PENDING))
+      throw new BadRequestException('Cannot cancel — some items have already been accepted or rejected');
+    if (transfer.status !== TransferStatus.PENDING)
+      throw new BadRequestException(`Transfer is already ${transfer.status.toLowerCase()}`);
+    if (user.role === UserRole.BRANCH_MANAGER && transfer.requestedById !== user.userId)
+      throw new ForbiddenException('Only the manager who created this transfer can cancel it');
+
+    await this.prisma.transfer.update({ where: { id }, data: { status: TransferStatus.CANCELLED } });
+
+    if (transfer.toBranch?.managerId) {
+      await this.notificationsService.create({
+        type: 'TRANSFER_CANCELLED',
+        title: 'Transfer Cancelled',
+        message: `Transfer of ${buildItemsSummary(transfer.items)} to your branch was cancelled`,
+        userId: transfer.toBranch.managerId,
+        entityId: id,
+        entityType: 'Transfer',
+      });
+    }
+
+    return this.findOne(id);
+  }
+
+  async cancelPendingTransfersWithInsufficientStock(branchId: string, productIds?: string[]) {
+    // 1. Find all active transfers from this branch with PENDING status
+    const pendingTransfers = await this.prisma.transfer.findMany({
+      where: {
+        fromBranchId: branchId,
+        status: TransferStatus.PENDING,
+        ...(productIds && productIds.length > 0
+          ? {
+              items: {
+                some: {
+                  productId: { in: productIds },
+                  status: TransferItemStatus.PENDING,
+                },
+              },
+            }
+          : {}),
+      },
+      include: {
+        items: {
+          include: { product: true },
+        },
+        fromBranch: { select: { id: true, name: true, managerId: true } },
+        toBranch:   { select: { id: true, name: true, managerId: true } },
+      },
+      orderBy: { createdAt: 'asc' }, // FIFO: oldest pending transfers get priority
+    });
+
+    if (pendingTransfers.length === 0) return;
+
+    // 2. Fetch current inventory at this branch for all products in these transfers
+    const affectedProductIds = Array.from(
+      new Set(pendingTransfers.flatMap((t) => t.items.map((i) => i.productId))),
+    );
+
+    const inventories = await this.prisma.inventory.findMany({
+      where: {
+        branchId,
+        productId: { in: affectedProductIds },
+      },
+    });
+
+    // 3. Create a working stock tracker to evaluate transfers sequentially
+    const stockTracker = new Map<
+      string,
+      { quantity: number; fullCylinders: number; emptyCylinders: number }
+    >();
+
+    for (const inv of inventories) {
+      const full = inv.fullCylinders ?? 0;
+      const total = inv.quantity ?? 0;
+      const empties = Math.max(0, total - full);
+      stockTracker.set(inv.productId, {
+        quantity: total,
+        fullCylinders: full,
+        emptyCylinders: empties,
+      });
+    }
+
+    // 4. Check each pending transfer
+    for (const transfer of pendingTransfers) {
+      let isInsufficient = false;
+      let failureReason = '';
+
+      for (const item of transfer.items) {
+        if (item.status !== TransferItemStatus.PENDING) continue;
+
+        const currentStock = stockTracker.get(item.productId) || {
+          quantity: 0,
+          fullCylinders: 0,
+          emptyCylinders: 0,
+        };
+
+        const isLpg = item.product?.isCylinderTracked || item.product?.isLpg;
+
+        if (isLpg) {
+          if (item.lpgComponent === LpgComponent.CYLINDER) {
+            if (currentStock.fullCylinders < item.quantity || currentStock.quantity < item.quantity) {
+              isInsufficient = true;
+              failureReason = `${item.product.name} (Complete Set): requested ${item.quantity}, only ${currentStock.fullCylinders} available`;
+              break;
+            }
+          } else if (item.lpgComponent === LpgComponent.REFILL) {
+            if (currentStock.fullCylinders < item.quantity) {
+              isInsufficient = true;
+              failureReason = `${item.product.name} (Gas Refill): requested ${item.quantity}, only ${currentStock.fullCylinders} available`;
+              break;
+            }
+          } else {
+            // EMPTY_SHELL or standard
+            if (currentStock.emptyCylinders < item.quantity) {
+              isInsufficient = true;
+              failureReason = `${item.product.name} (Empty Shell): requested ${item.quantity}, only ${currentStock.emptyCylinders} available`;
+              break;
+            }
+          }
+        } else {
+          if (currentStock.quantity < item.quantity) {
+            isInsufficient = true;
+            failureReason = `${item.product.name}: requested ${item.quantity}, only ${currentStock.quantity} in stock`;
+            break;
+          }
+        }
+      }
+
+      if (isInsufficient) {
+        // Automatically cancel this transfer
+        await this.prisma.transfer.update({
+          where: { id: transfer.id },
+          data: {
+            status: TransferStatus.CANCELLED,
+            notes: transfer.notes
+              ? `${transfer.notes} | Auto-cancelled: Insufficient stock after sale (${failureReason})`
+              : `Auto-cancelled: Insufficient stock after sale (${failureReason})`,
+          },
+        });
+
+        // Notify destination branch manager
+        if (transfer.toBranch?.managerId) {
+          await this.notificationsService.create({
+            type: 'TRANSFER_CANCELLED',
+            title: 'Transfer Auto-Cancelled',
+            message: `Transfer ${transfer.transferCode} from ${transfer.fromBranch.name} was automatically cancelled due to insufficient stock following a sale.`,
+            userId: transfer.toBranch.managerId,
+            entityId: transfer.id,
+            entityType: 'Transfer',
+          });
+        }
+
+        // Notify source branch manager / creator
+        const requesterId = transfer.requestedById || transfer.fromBranch?.managerId;
+        if (requesterId) {
+          await this.notificationsService.create({
+            type: 'TRANSFER_CANCELLED',
+            title: 'Transfer Auto-Cancelled',
+            message: `Transfer ${transfer.transferCode} to ${transfer.toBranch.name} was automatically cancelled: insufficient stock for ${failureReason}.`,
+            userId: requesterId,
+            entityId: transfer.id,
+            entityType: 'Transfer',
+          });
+        }
+
+        // Log to Activity Feed
+        await this.prisma.activityFeed.create({
+          data: {
+            type: 'TRANSFER_CANCELLED',
+            branchId: transfer.fromBranchId,
+            title: 'Transfer Auto-Cancelled',
+            message: `Transfer ${transfer.transferCode} to ${transfer.toBranch.name} was automatically cancelled due to insufficient stock following a sale (${failureReason}).`,
+            entityId: transfer.id,
+            entityType: 'Transfer',
+            visibleToBranch: true,
+          },
+        });
+      } else {
+        // Reserve stock for this transfer so subsequent pending transfers don't over-allocate
+        for (const item of transfer.items) {
+          if (item.status !== TransferItemStatus.PENDING) continue;
+          const currentStock = stockTracker.get(item.productId);
+          if (currentStock) {
+            const isLpg = item.product?.isCylinderTracked || item.product?.isLpg;
+            if (isLpg) {
+              if (item.lpgComponent === LpgComponent.CYLINDER) {
+                currentStock.fullCylinders -= item.quantity;
+                currentStock.quantity -= item.quantity;
+              } else if (item.lpgComponent === LpgComponent.REFILL) {
+                currentStock.fullCylinders -= item.quantity;
+              } else {
+                currentStock.emptyCylinders -= item.quantity;
+                currentStock.quantity -= item.quantity;
+              }
+            } else {
+              currentStock.quantity -= item.quantity;
+            }
+          }
+        }
+      }
+    }
+  }
+}

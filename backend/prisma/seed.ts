@@ -1,0 +1,202 @@
+import { PrismaClient, UserRole, ProductType } from '@prisma/client';
+import * as bcrypt from 'bcrypt';
+
+const prisma = new PrismaClient();
+
+async function main() {
+  console.log('Starting Njugush POS database seed...');
+
+  // 1. Create Branches
+  const branches = await Promise.all([
+    prisma.branch.upsert({
+      where: { code: 'HQ' },
+      update: {},
+      create: { name: 'Headquarters', code: 'HQ', address: 'Main Street, Nairobi', phone: '+254727202627', email: 'hq@njugush.co.ke' },
+    }),
+    prisma.branch.upsert({
+      where: { code: 'BR01' },
+      update: {},
+      create: { name: 'KANAM', code: 'BR01', address: 'Kanam, Lodwar', phone: '+254700000002', email: 'westlands@njugush.co.ke' },
+    }),
+    prisma.branch.upsert({
+      where: { code: 'BR02' },
+      update: {},
+      create: { name: 'KANAM 2', code: 'BR02', address: 'Antidonte, Lodwar', phone: '+254700000003', email: 'eastleigh@njugush.co.ke' },
+    }),
+    prisma.branch.upsert({
+      where: { code: 'BR03' },
+      update: {},
+      create: { name: 'KALOKOL', code: 'BR03', address: 'Kalokol, Lodwar', phone: '+254700000004', email: 'karen@njugush.co.ke' },
+    }),
+    prisma.branch.upsert({
+      where: { code: 'BR04' },
+      update: {},
+      create: { name: 'STORE', code: 'BR04', address: 'Kanam, Lodwar', phone: '+254700000005', email: 'ngong@njugush.co.ke' },
+    }),
+    prisma.branch.upsert({
+      where: { code: 'BR05' },
+      update: {},
+      create: { name: 'GOLD', code: 'BR05', address: 'Lodwar, Kenya', phone: '+254700000006', email: 'mombasaroad@njugush.co.ke' },
+    }),
+    prisma.branch.upsert({
+      where: { code: 'BR06' },
+      update: {},
+      create: { name: 'Branch 6 - Thika Road', code: 'BR06', address: 'Thika Road, Nairobi', phone: '+254700000007', email: 'thikaroad@njugush.co.ke' },
+    }),
+  ]);
+
+  console.log(`Created ${branches.length} branches`);
+
+  // 2. Create Users
+  const hashedPassword = await bcrypt.hash('admin123', 10);
+
+  await prisma.user.upsert({
+    where: { email: 'charleynjuguna89@gmail.com' },
+    update: {},
+    create: { email: 'charleynjuguna89@gmail.com', password: hashedPassword, firstName: 'Njugush', lastName: 'CEO', phone: '+254727202653', role: UserRole.SUPER_ADMIN, status: 'ACTIVE', branchId: branches[0].id },
+  });
+
+  await prisma.user.upsert({
+    where: { email: 'manager@njugush.co.ke' },
+    update: {},
+    create: { email: 'manager@njugush.co.ke', password: hashedPassword, firstName: 'Overall', lastName: 'Manager', phone: '+254711111111', role: UserRole.OVERALL_MANAGER, status: 'ACTIVE' },
+  });
+
+  for (let i = 1; i < branches.length; i++) {
+    await prisma.user.upsert({
+      where: { email: `bm${i}@njugush.co.ke` },
+      update: {},
+      create: { email: `bm${i}@njugush.co.ke`, password: hashedPassword, firstName: `Branch${i}`, lastName: 'Manager', phone: `+25472222222${i}`, role: UserRole.BRANCH_MANAGER, status: 'ACTIVE', branchId: branches[i].id },
+    });
+  }
+
+  // 3. Create the Starter Pack Categories
+  const categoryNames = ['3Kg LPG', '6Kg LPG', '13Kg LPG', '50Kg LPG', 'Accessories', 'Electronics'];
+  const categories: Record<string, string> = {};
+
+  for (const name of categoryNames) {
+    const cat = await prisma.productCategory.upsert({
+      where: { name },
+      update: {},
+      create: { name },
+    });
+    categories[name] = cat.id;
+  }
+  console.log(`Created ${Object.keys(categories).length} categories`);
+
+  // 4. Create Starter Pack Products
+  const brands = ['Afri Gas', 'Hashi', 'K-Gas', 'Mwanga', 'Ola', 'Others', 'Pro-Gas', 'Supa', 'Top', 'Total'];
+  const products = [];
+
+  // Seed 6Kg Products (Refill: 1400, Empty: 3000)
+  for (const brand of brands) {
+    const code = `6KG-${brand.toUpperCase().replace(/\s+/g, '')}`;
+    const product = await prisma.product.upsert({
+      where: { code },
+      update: {},
+      create: {
+        name: `${brand} 6Kg`,
+        code,
+        type: ProductType.LPG_REFILL,
+        categoryId: categories['6Kg LPG'],
+        price: 1400,
+        wholesalePrice: 1050,
+        emptyPrice: 3000,
+        wholesaleEmptyPrice: 3000,
+        isCylinderTracked: true,
+        minStockLevel: 10,
+      },
+    });
+    products.push(product);
+  }
+
+  // Seed 13Kg Products (Refill: 3000, Empty: 5000)
+  for (const brand of brands) {
+    const code = `13KG-${brand.toUpperCase().replace(/\s+/g, '')}`;
+    const product = await prisma.product.upsert({
+      where: { code },
+      update: {},
+      create: {
+        name: `${brand} 13Kg`,
+        code,
+        type: ProductType.LPG_REFILL,
+        categoryId: categories['13Kg LPG'],
+        price: 3000,
+        wholesalePrice: 2200,
+        emptyPrice: 5000,
+        wholesaleEmptyPrice: 5000,
+        isCylinderTracked: true,
+        minStockLevel: 10,
+      },
+    });
+    products.push(product);
+  }
+
+  console.log(`Created ${products.length} LPG products`);
+
+  // 5. Initialize Inventory for all branches
+  for (const branch of branches) {
+    for (const product of products) {
+      await prisma.inventory.upsert({
+        where: { branchId_productId: { branchId: branch.id, productId: product.id } },
+        update: {},
+        create: {
+          branchId: branch.id,
+          productId: product.id,
+          quantity: 1000,
+          fullCylinders: 1000,
+        },
+      });
+    }
+  }
+  console.log('Initialized stock trackers for all branches');
+
+  // 6. Settings and Customers
+  // Note: SystemSetting schema only has key, value, description — isPublic does not exist
+  const settingsData = [
+    { key: 'CEO_PHONE', value: '+254727202653', description: 'CEO phone number' },
+    { key: 'CEO_EMAIL', value: 'ceo@njugush.co.ke', description: 'CEO email address' },
+    { key: 'SMS_ENABLED', value: 'true', description: 'Enable SMS' },
+    { key: 'DAILY_CLOSE_TIME', value: '21:00', description: 'Daily closing time' },
+    { key: 'LOW_STOCK_ALERT', value: 'true', description: 'Enable low stock alerts' },
+    { key: 'MPESA_PAYBILL', value: '247247', description: 'M-Pesa Paybill' },
+  ];
+
+  for (const s of settingsData) {
+    await prisma.systemSetting.upsert({ where: { key: s.key }, update: {}, create: s });
+  }
+
+  // Customer schema fields: name, phone, email, address, notes, creditLimit, creditUsed, totalPurchases, isActive
+  // fullName, customerCode, businessName, isInvoiceEligible do NOT exist
+  const customersData = [
+    { name: 'BLESSKY', phone: '+254712345678', email: 'john@example.com', creditLimit: 50000 },
+    { name: 'PETER JAMII', phone: '+254723456789', email: 'mary@example.com', creditLimit: 30000 },
+    { name: 'LOKIMAT MATRESS', phone: '+254734567890', creditLimit: 100000 },
+  ];
+
+  for (const c of customersData) {
+    await prisma.customer.upsert({
+      where: { phone: c.phone },
+      update: {},
+      create: {
+        name: c.name,
+        phone: c.phone,
+        email: c.email ?? null,
+        creditLimit: c.creditLimit,
+      },
+    });
+  }
+
+  console.log('\n========================================');
+  console.log('  SEED COMPLETED SUCCESSFULLY');
+  console.log('========================================\n');
+}
+
+main()
+  .catch((e) => {
+    console.error('Seed failed:', e);
+    process.exit(1);
+  })
+  .finally(async () => {
+    await prisma.$disconnect();
+  });
