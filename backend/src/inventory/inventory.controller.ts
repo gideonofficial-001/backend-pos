@@ -84,6 +84,21 @@ export class InventoryController {
     });
   }
 
+  @Get('cylinders/available')
+  @Roles(
+    UserRole.SUPER_ADMIN,
+    UserRole.OVERALL_MANAGER,
+    UserRole.BRANCH_MANAGER,
+  )
+  @ApiOperation({ summary: 'Get available cylinders for a product at a branch' })
+  async getAvailableCylinders(
+    @Query('branchId') branchId: string,
+    @Query('productId') productId: string,
+    @Query('status') status?: string,
+  ) {
+    return this.inventoryService.getAvailableCylinders(branchId, productId, status);
+  }
+
   @Get(':id')
   @Roles(
     UserRole.SUPER_ADMIN,

@@ -15,9 +15,11 @@ import {
   ProductType,
   LpgSaleVariant,
   PaymentProvider,
+  AuditAction,
 } from '@prisma/client';
 import { CreateSaleDto } from './dto/create-sale.dto';
 import { TransfersService } from '../transfers/transfers.service';
+import { MpesaService } from '../mpesa/mpesa.service';
 
 @Injectable()
 export class SalesService {
@@ -26,6 +28,7 @@ export class SalesService {
     private auditLogsService: AuditLogsService,
     private notificationsService: NotificationsService,
     private transfersService: TransfersService,
+    private mpesaService: MpesaService,
   ) {}
 
   async create(createSaleDto: CreateSaleDto, user: any) {
@@ -57,7 +60,24 @@ export class SalesService {
       throw new BadRequestException('A registered customer is required for invoice sales.');
     }
 
-    // ── 1. PRE-CALCULATION & PRICING ───────────────────────────────────────
+    // ── 1. IDEMPOTENCY CHECK ───────────────────────────────────────────────
+    if (createSaleDto.idempotencyKey) {
+      const existingSale = await this.prisma.sale.findUnique({
+        where: { idempotencyKey: createSaleDto.idempotencyKey },
+        include: {
+          saleItems: { include: { product: true } },
+          payments: true,
+          branch: true,
+          user: { select: { id: true, firstName: true, lastName: true } },
+          customer: true,
+        },
+      });
+      if (existingSale) {
+        return existingSale;
+      }
+    }
+
+    // ── 2. PRE-CALCULATION, PRICING & CYLINDER VALIDATION ───────────────────
     let subtotal = 0;
     let totalDiscount = 0;
     const saleItems: any[] = [];
@@ -89,10 +109,35 @@ export class SalesService {
       }
 
       const lineSubtotal = unitPrice * item.quantity;
-      const itemDiscount = Math.min(Number(item.discount || 0), lineSubtotal);
+      const itemDiscount = Math.min(Math.max(0, Number(item.discount || 0)), lineSubtotal);
       const lineTotal = lineSubtotal - itemDiscount;
       subtotal += lineSubtotal;
       totalDiscount += itemDiscount;
+
+      // Validate cylinder selection if provided
+      let assignedCylinderId = item.cylinderId;
+      if (assignedCylinderId) {
+        const cyl = await this.prisma.cylinder.findUnique({ where: { id: assignedCylinderId } });
+        if (!cyl) {
+          throw new BadRequestException(`Cylinder with ID ${assignedCylinderId} not found`);
+        }
+        if (cyl.branchId !== branchId) {
+          throw new BadRequestException(`Cylinder ${cyl.serialNumber} does not belong to this branch`);
+        }
+        if (cyl.productId !== item.productId) {
+          throw new BadRequestException(`Cylinder ${cyl.serialNumber} does not match product ${product.name}`);
+        }
+        if (variant === LpgSaleVariant.EMPTY_SHELL) {
+          if (cyl.status !== 'EMPTY') {
+            throw new BadRequestException(`Cylinder ${cyl.serialNumber} is not EMPTY (current status: ${cyl.status})`);
+          }
+        } else {
+          if (cyl.status !== 'FULL') {
+            throw new BadRequestException(`Cylinder ${cyl.serialNumber} is not FULL (current status: ${cyl.status})`);
+          }
+        }
+      }
+
       saleItems.push({
         productId: item.productId,
         quantity: item.quantity,
@@ -100,10 +145,27 @@ export class SalesService {
         discount: itemDiscount,
         total: lineTotal,
         lpgVariant: variant ?? undefined,
+        cylinderId: assignedCylinderId || undefined,
       });
     }
 
-    const total = subtotal - totalDiscount;
+    const total = Math.max(0, subtotal - totalDiscount);
+
+    // ── 3. DISCOUNT AUTHORIZATION & THRESHOLD CHECK ─────────────────────────
+    if (totalDiscount > 0 && user.role === UserRole.BRANCH_MANAGER) {
+      const isExceeded = totalDiscount > 500 || totalDiscount > (subtotal * 0.10 + 0.01);
+      if (isExceeded) {
+        const overrideSetting = await this.prisma.systemSetting.findUnique({
+          where: { key: 'DISCOUNT_OVERRIDE_CODE' },
+        });
+        const validCode = overrideSetting?.value || 'ADMIN123';
+        if (!createSaleDto.managerOverrideCode || createSaleDto.managerOverrideCode.trim() !== validCode.trim()) {
+          throw new BadRequestException(
+            `Discount of KES ${totalDiscount.toFixed(2)} exceeds branch manager authorization limit (Max 10% or KES 500). A valid manager override code is required.`,
+          );
+        }
+      }
+    }
 
     // Unique sale code
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -115,22 +177,30 @@ export class SalesService {
       ).join('');
     } while (await this.prisma.sale.findUnique({ where: { saleCode } }));
 
-    // ── 2. ATOMIC TRANSACTION (Stock Validation, Deductions, Payments, Customer Debt) ──
-    const sale = await this.prisma.$transaction(async (tx) => {
-      // A. Atomic Stock Validation INSIDE Transaction
+    // ── 4. STK PUSH LIFECYCLE (PENDING SALE CREATED BEFORE STK) ─────────────
+    const isStk = !!createSaleDto.isStkPending || (
+      payments && payments.some((p) => p.method === PaymentProvider.MPESA && !p.mpesaRef && !!p.phoneNumber)
+    );
+
+    if (isStk) {
+      const mpesaPayment = payments?.find(
+        (p) => p.method === PaymentProvider.MPESA && !!p.phoneNumber,
+      );
+      if (!mpesaPayment) {
+        throw new BadRequestException('A valid phone number is required to initiate M-Pesa STK push');
+      }
+
+      // Pre-validate inventory availability without decrementing yet
       for (const item of items) {
-        const inventory = await tx.inventory.findUnique({
+        const inventory = await this.prisma.inventory.findUnique({
           where: { branchId_productId: { branchId, productId: item.productId } },
           include: { product: true },
         });
-
         if (!inventory) {
           throw new BadRequestException(`Product not found in branch inventory`);
         }
-
         const variant = this.resolveVariant(inventory.product.type, item.lpgVariant);
         const availableEmpty = inventory.fullCylinders != null ? inventory.quantity - inventory.fullCylinders : 0;
-
         if (variant === LpgSaleVariant.EMPTY_SHELL) {
           if (availableEmpty < item.quantity) {
             throw new BadRequestException(`Insufficient empty shells for ${inventory.product.name}. Available: ${availableEmpty}`);
@@ -146,193 +216,384 @@ export class SalesService {
         }
       }
 
-      // B. Customer Credit Limit Check & Debt Tracking
-      if (type === SaleType.INVOICE && customerId) {
-        const customer = await tx.customer.findUnique({ where: { id: customerId } });
-        if (!customer) throw new NotFoundException('Customer not found');
-        const currentDebt = Number(customer.creditUsed || 0);
-        const creditLimit = Number(customer.creditLimit || 0);
-        if (creditLimit > 0 && currentDebt + total > creditLimit) {
-          throw new BadRequestException(
-            `Credit limit exceeded for ${customer.name}. Current debt: KES ${currentDebt.toFixed(2)}, Limit: KES ${creditLimit.toFixed(2)}, This Sale: KES ${total.toFixed(2)}`,
-          );
-        }
-        await tx.customer.update({
-          where: { id: customerId },
+      // Create PENDING sale (idempotent DB insert)
+      let pendingSale: any;
+      try {
+        pendingSale = await this.prisma.sale.create({
           data: {
-            creditUsed: { increment: total },
-            totalPurchases: { increment: total },
-          },
-        });
-      } else if (customerId) {
-        await tx.customer.update({
-          where: { id: customerId },
-          data: { totalPurchases: { increment: total } },
-        });
-      }
-
-        // C. Payment Breakdown Handling & Primary Provider Determination
-let derivedMpesaRef: string | null = null;
-const paymentRecords: any[] = [];
-
-let hasMpesa = false;
-
-if (payments && payments.length > 0) {
-  for (const p of payments) {
-    if (p.method === PaymentProvider.MPESA && p.amount > 0) {
-      hasMpesa = true;
-
-      if (p.mpesaRef) {
-        derivedMpesaRef = p.mpesaRef;
-      }
-    }
-
-    paymentRecords.push({
-      method: p.method,
-      amount: p.amount,
-      mpesaRef: p.mpesaRef || null,
-    });
-  }
-} else {
-  paymentRecords.push({
-    method: PaymentProvider.CASH,
-    amount: total,
-  });
-}
-
-// Determine provider after the payment loop.
-// M-Pesa takes precedence for mixed Cash + M-Pesa payments.
-const derivedPaymentProvider: PaymentProvider =
-  hasMpesa ? PaymentProvider.MPESA : PaymentProvider.CASH;
-      
-      // D. Create Sale Record
-      const newSale = await tx.sale.create({
-        data: {
-          saleCode,
-          branchId,
-          userId: user.userId,
-          customerId,
-          type,
-          status: SaleStatus.COMPLETED,
-          subtotal,
-          discount: totalDiscount,
-          total,
-          paymentProvider: derivedPaymentProvider,
-          mpesaRef: derivedMpesaRef,
-          notes,
-          saleItems: { create: saleItems },
-          payments: { create: paymentRecords },
-        },
-        include: {
-          saleItems: { include: { product: true } },
-          payments: true,
-          branch: true,
-          user: { select: { id: true, firstName: true, lastName: true } },
-        },
-      });
-
-      // E. Link Any Matching M-Pesa Transaction
-      if (derivedMpesaRef) {
-        await tx.mpesaTransaction.updateMany({
-          where: { receiptNumber: derivedMpesaRef, saleId: null },
-          data: { saleId: newSale.id },
-        });
-      }
-
-      // F. Automatic Invoice Generation
-      if (type === SaleType.INVOICE && customerId) {
-        const invCount = await tx.invoice.count();
-        const invoiceCode = `INV-${String(invCount + 1).padStart(5, '0')}`;
-
-        await tx.invoice.create({
-          data: {
-            invoiceCode,
+            saleCode,
             branchId,
-            customerId,
             userId: user.userId,
-            saleId: newSale.id,
-            status: 'PENDING',
+            customerId,
+            type,
+            status: SaleStatus.PENDING,
             subtotal,
             discount: totalDiscount,
             total,
-            balance: total,
-            dueDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // Default due date 7 days
-            notes: notes || 'Auto-generated from POS checkout',
+            paymentProvider: PaymentProvider.MPESA,
+            notes: notes ? `${notes} (Awaiting M-Pesa STK push)` : 'Awaiting M-Pesa STK push',
+            idempotencyKey: createSaleDto.idempotencyKey || null,
+            saleItems: { create: saleItems },
+          },
+          include: {
+            saleItems: { include: { product: true } },
+            payments: true,
+            branch: true,
+            user: { select: { id: true, firstName: true, lastName: true } },
+            customer: true,
           },
         });
-      }
-
-      // G. Deduct Inventory & Record Stock Movements
-      for (const item of items) {
-        const product = await tx.product.findUnique({
-          where: { id: item.productId },
-        });
-        const inventory = await tx.inventory.findUnique({
-          where: {
-            branchId_productId: { branchId, productId: item.productId },
-          },
-        });
-        const variant = this.resolveVariant(product.type, item.lpgVariant);
-
-        // Optional Serialized Cylinder status transition
-        if (item.cylinderId) {
-          await tx.cylinder.updateMany({
-            where: { id: item.cylinderId, branchId },
-            data: { status: 'EMPTY' },
-          });
-        } else if (item.serialNumber) {
-          await tx.cylinder.updateMany({
-            where: { serialNumber: item.serialNumber, branchId },
-            data: { status: 'EMPTY' },
+      } catch (err: any) {
+        if (err.code === 'P2002' && createSaleDto.idempotencyKey) {
+          return this.prisma.sale.findUnique({
+            where: { idempotencyKey: createSaleDto.idempotencyKey },
+            include: {
+              saleItems: { include: { product: true } },
+              payments: true,
+              branch: true,
+              user: { select: { id: true, firstName: true, lastName: true } },
+              customer: true,
+            },
           });
         }
+        throw err;
+      }
 
-        const updateData: any = {
-          totalSold: { increment: item.quantity },
+      // Trigger STK push linked to this pending sale
+      try {
+        const stkRes = await this.mpesaService.initiateStkPush(
+          mpesaPayment.phoneNumber!,
+          mpesaPayment.amount || total,
+          pendingSale.id,
+        );
+        return {
+          ...pendingSale,
+          checkoutRequestId: stkRes.checkoutRequestId,
+          message: stkRes.message,
         };
-        let quantityDelta = -item.quantity;
+      } catch (stkErr: any) {
+        await this.prisma.sale.update({
+          where: { id: pendingSale.id },
+          data: {
+            status: SaleStatus.CANCELLED,
+            notes: `Failed to initiate STK push: ${stkErr.message || 'Gateway error'}`,
+          },
+        });
+        throw stkErr;
+      }
+    }
 
-        if (product.type === ProductType.LPG_REFILL) {
-          if (variant === LpgSaleVariant.REFILL) {
-            updateData.fullCylinders = { decrement: item.quantity };
-            quantityDelta = 0;
-          } else if (variant === LpgSaleVariant.EMPTY_SHELL) {
-            updateData.quantity = { decrement: item.quantity };
-          } else if (variant === LpgSaleVariant.COMPLETE_SET) {
-            updateData.fullCylinders = { decrement: item.quantity };
-            updateData.quantity = { decrement: item.quantity };
+    // ── 5. IMMEDIATE PAYMENT AMOUNT VALIDATION ──────────────────────────────
+    let derivedMpesaRef: string | null = null;
+    let finalNotes = notes || '';
+    const paymentRecords: any[] = [];
+    let hasMpesa = false;
+
+    if (type !== SaleType.INVOICE) {
+      const totalPaid = (payments && payments.length > 0)
+        ? payments.reduce((sum, p) => sum + Number(p.amount || 0), 0)
+        : total;
+
+      if (totalPaid < total) {
+        throw new BadRequestException(
+          `Underpayment not permitted. Total is KES ${total.toFixed(2)}, but total payments provided are KES ${totalPaid.toFixed(2)}`,
+        );
+      }
+
+      const nonCashTotal = payments
+        ? payments.filter((p) => p.method !== PaymentProvider.CASH).reduce((s, p) => s + Number(p.amount || 0), 0)
+        : 0;
+
+      if (nonCashTotal > total) {
+        throw new BadRequestException(
+          `Non-cash overpayment is not permitted. Non-cash payments sum to KES ${nonCashTotal.toFixed(2)} for a total of KES ${total.toFixed(2)}`,
+        );
+      }
+
+      const changeTendered = totalPaid - total;
+      if (changeTendered > 0) {
+        finalNotes = (finalNotes ? `${finalNotes} | ` : '') +
+          `Cash tendered: KES ${totalPaid.toFixed(2)}, Change given: KES ${changeTendered.toFixed(2)}`;
+      }
+
+      // Record payments: non-cash exact, cash adjusted for net cash collected in drawer
+      let remainingToCover = total;
+      if (payments && payments.length > 0) {
+        for (const p of payments) {
+          if (p.method !== PaymentProvider.CASH && p.amount > 0) {
+            hasMpesa = hasMpesa || p.method === PaymentProvider.MPESA;
+            if (p.method === PaymentProvider.MPESA && p.mpesaRef) {
+              derivedMpesaRef = p.mpesaRef;
+            }
+            paymentRecords.push({
+              method: p.method,
+              amount: p.amount,
+              mpesaRef: p.mpesaRef || null,
+            });
+            remainingToCover -= p.amount;
           }
-        } else if (product.type === ProductType.LPG_CYLINDER) {
-          updateData.fullCylinders = { decrement: item.quantity };
-          updateData.quantity = { decrement: item.quantity };
-        } else {
-          updateData.quantity = { decrement: item.quantity };
+        }
+        const cashPayments = payments.filter((p) => p.method === PaymentProvider.CASH);
+        if (cashPayments.length > 0) {
+          paymentRecords.push({
+            method: PaymentProvider.CASH,
+            amount: Math.max(0, remainingToCover),
+            mpesaRef: null,
+          });
+        }
+      } else {
+        paymentRecords.push({
+          method: PaymentProvider.CASH,
+          amount: total,
+          mpesaRef: null,
+        });
+      }
+    }
+
+    const derivedPaymentProvider: PaymentProvider = hasMpesa
+      ? PaymentProvider.MPESA
+      : PaymentProvider.CASH;
+
+    // ── 6. ATOMIC TRANSACTION (Stock Deductions, Payments, Customer Debt) ──
+    let sale: any;
+    try {
+      sale = await this.prisma.$transaction(async (tx) => {
+        // A. Customer Debt Tracking
+        if (type === SaleType.INVOICE && customerId) {
+          const customer = await tx.customer.findUnique({ where: { id: customerId } });
+          if (!customer) throw new NotFoundException('Customer not found');
+          const currentDebt = Number(customer.creditUsed || 0);
+          const creditLimit = Number(customer.creditLimit || 0);
+          if (creditLimit > 0 && currentDebt + total > creditLimit) {
+            throw new BadRequestException(
+              `Credit limit exceeded for ${customer.name}. Current debt: KES ${currentDebt.toFixed(2)}, Limit: KES ${creditLimit.toFixed(2)}, This Sale: KES ${total.toFixed(2)}`,
+            );
+          }
+          await tx.customer.update({
+            where: { id: customerId },
+            data: {
+              creditUsed: { increment: total },
+              totalPurchases: { increment: total },
+            },
+          });
+        } else if (customerId) {
+          await tx.customer.update({
+            where: { id: customerId },
+            data: { totalPurchases: { increment: total } },
+          });
         }
 
-        await tx.inventory.update({
-          where: {
-            branchId_productId: { branchId, productId: item.productId },
+        // B. Create Sale Record
+        const newSale = await tx.sale.create({
+          data: {
+            saleCode,
+            branchId,
+            userId: user.userId,
+            customerId,
+            type,
+            status: SaleStatus.COMPLETED,
+            subtotal,
+            discount: totalDiscount,
+            total,
+            paymentProvider: derivedPaymentProvider,
+            mpesaRef: derivedMpesaRef,
+            notes: finalNotes || null,
+            idempotencyKey: createSaleDto.idempotencyKey || null,
+            saleItems: { create: saleItems },
+            payments: { create: paymentRecords },
           },
-          data: updateData,
+          include: {
+            saleItems: { include: { product: true } },
+            payments: true,
+            branch: true,
+            user: { select: { id: true, firstName: true, lastName: true } },
+            customer: true,
+          },
         });
 
-        await tx.stockMovement.create({
-          data: {
-            inventoryId: inventory.id,
-            type: MovementType.SALE,
-            quantity: quantityDelta,
-            referenceId: newSale.id,
-            referenceType: 'Sale',
-            performedById: user.userId,
-            notes: `Sale ${saleCode}${variant ? ` (${variant})` : ''}`,
+        // C. Link Matching M-Pesa Transaction if provided
+        if (derivedMpesaRef) {
+          await tx.mpesaTransaction.updateMany({
+            where: { receiptNumber: derivedMpesaRef, saleId: null },
+            data: { saleId: newSale.id },
+          });
+        }
+
+        // D. Automatic Invoice Generation
+        if (type === SaleType.INVOICE && customerId) {
+          const invCount = await tx.invoice.count();
+          const invoiceCode = `INV-${String(invCount + 1).padStart(5, '0')}`;
+
+          await tx.invoice.create({
+            data: {
+              invoiceCode,
+              branchId,
+              customerId,
+              userId: user.userId,
+              saleId: newSale.id,
+              status: 'PENDING',
+              subtotal,
+              discount: totalDiscount,
+              total,
+              balance: total,
+              dueDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+              notes: notes || 'Auto-generated from POS checkout',
+            },
+          });
+        }
+
+        // E. Atomic Stock Deductions (using updateMany with gte guards)
+        for (const item of items) {
+          const product = await tx.product.findUnique({
+            where: { id: item.productId },
+          });
+          const variant = this.resolveVariant(product!.type, item.lpgVariant);
+          let quantityDelta = -item.quantity;
+
+          if (product!.type === ProductType.LPG_REFILL) {
+            if (variant === LpgSaleVariant.REFILL) {
+              const res = await tx.inventory.updateMany({
+                where: {
+                  branchId,
+                  productId: item.productId,
+                  fullCylinders: { gte: item.quantity },
+                },
+                data: {
+                  fullCylinders: { decrement: item.quantity },
+                  totalSold: { increment: item.quantity },
+                },
+              });
+              if (res.count !== 1) {
+                throw new BadRequestException(`Insufficient full cylinders for ${product!.name}`);
+              }
+              quantityDelta = 0;
+            } else if (variant === LpgSaleVariant.EMPTY_SHELL) {
+              const res = await tx.inventory.updateMany({
+                where: {
+                  branchId,
+                  productId: item.productId,
+                  quantity: { gte: item.quantity },
+                },
+                data: {
+                  quantity: { decrement: item.quantity },
+                  totalSold: { increment: item.quantity },
+                },
+              });
+              if (res.count !== 1) {
+                throw new BadRequestException(`Insufficient empty shells for ${product!.name}`);
+              }
+            } else if (variant === LpgSaleVariant.COMPLETE_SET) {
+              const res = await tx.inventory.updateMany({
+                where: {
+                  branchId,
+                  productId: item.productId,
+                  quantity: { gte: item.quantity },
+                  fullCylinders: { gte: item.quantity },
+                },
+                data: {
+                  quantity: { decrement: item.quantity },
+                  fullCylinders: { decrement: item.quantity },
+                  totalSold: { increment: item.quantity },
+                },
+              });
+              if (res.count !== 1) {
+                throw new BadRequestException(`Insufficient stock or full cylinders for ${product!.name}`);
+              }
+            }
+          } else if (product!.type === ProductType.LPG_CYLINDER) {
+            const res = await tx.inventory.updateMany({
+              where: {
+                branchId,
+                productId: item.productId,
+                quantity: { gte: item.quantity },
+                fullCylinders: { gte: item.quantity },
+              },
+              data: {
+                quantity: { decrement: item.quantity },
+                fullCylinders: { decrement: item.quantity },
+                totalSold: { increment: item.quantity },
+              },
+            });
+            if (res.count !== 1) {
+              throw new BadRequestException(`Insufficient stock for ${product!.name}`);
+            }
+          } else {
+            const res = await tx.inventory.updateMany({
+              where: {
+                branchId,
+                productId: item.productId,
+                quantity: { gte: item.quantity },
+              },
+              data: {
+                quantity: { decrement: item.quantity },
+                totalSold: { increment: item.quantity },
+              },
+            });
+            if (res.count !== 1) {
+              throw new BadRequestException(`Insufficient stock for ${product!.name}`);
+            }
+          }
+
+          // Update cylinder status if tracked
+          if (item.cylinderId) {
+            await tx.cylinder.updateMany({
+              where: { id: item.cylinderId, branchId },
+              data: { status: 'EMPTY' },
+            });
+          } else if (item.serialNumber) {
+            await tx.cylinder.updateMany({
+              where: { serialNumber: item.serialNumber, branchId },
+              data: { status: 'EMPTY' },
+            });
+          }
+
+          // Stock Movement
+          const inv = await tx.inventory.findUnique({
+            where: { branchId_productId: { branchId, productId: item.productId } },
+          });
+          await tx.stockMovement.create({
+            data: {
+              inventoryId: inv!.id,
+              type: MovementType.SALE,
+              quantity: quantityDelta,
+              referenceId: newSale.id,
+              referenceType: 'Sale',
+              performedById: user.userId,
+              notes: `Sale ${saleCode}${variant ? ` (${variant})` : ''}`,
+            },
+          });
+        }
+
+        return newSale;
+      });
+    } catch (err: any) {
+      if (err.code === 'P2002' && createSaleDto.idempotencyKey) {
+        return this.prisma.sale.findUnique({
+          where: { idempotencyKey: createSaleDto.idempotencyKey },
+          include: {
+            saleItems: { include: { product: true } },
+            payments: true,
+            branch: true,
+            user: { select: { id: true, firstName: true, lastName: true } },
+            customer: true,
           },
         });
       }
+      throw err;
+    }
 
-      return newSale;
-    });
+    // ── 7. AUDIT LOGGING & NOTIFICATIONS ───────────────────────────────────
+    if (totalDiscount > 0) {
+      await this.auditLogsService.create({
+        userId: user.userId,
+        action: AuditAction.DISCOUNT_APPLIED,
+        description: `Applied discount of KES ${totalDiscount.toFixed(2)} on sale ${saleCode}. Reason: ${createSaleDto.discountReason || 'None'}`,
+        entityType: 'Sale',
+        entityId: sale.id,
+        newValues: { totalDiscount, discountReason: createSaleDto.discountReason },
+      });
+    }
 
-    // ── 4. LOGGING ─────────────────────────────────────────────────────────
     await this.auditLogsService.create({
       userId: user.userId,
       action: 'SALE_CREATED',
@@ -354,15 +615,12 @@ const derivedPaymentProvider: PaymentProvider =
       },
     });
 
-    // NOTIFY ALL ADMINS ABOUT THE INVOICE
     if (type === SaleType.INVOICE) {
       const admins = await this.prisma.user.findMany({
         where: { role: { in: [UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER] } },
         select: { id: true },
       });
-      
       const branch = await this.prisma.branch.findUnique({ where: { id: branchId } });
-
       await Promise.all(
         admins.map((admin) =>
           this.notificationsService.create({
@@ -377,7 +635,7 @@ const derivedPaymentProvider: PaymentProvider =
       );
     }
 
-    // ── 5. CHECK & AUTO-CANCEL PENDING TRANSFERS IF STOCK IS NOW INSUFFICIENT ──
+    // Check & auto-cancel pending transfers if stock is now insufficient
     try {
       await this.transfersService.cancelPendingTransfersWithInsufficientStock(
         branchId,
@@ -390,6 +648,30 @@ const derivedPaymentProvider: PaymentProvider =
     return sale;
   }
 
+  async cancel(id: string, user: any) {
+    const sale = await this.prisma.sale.findUnique({
+      where: { id },
+      include: { payments: true },
+    });
+    if (!sale) throw new NotFoundException('Sale not found');
+    if (user.role === UserRole.BRANCH_MANAGER && user.branchId !== sale.branchId) {
+      throw new ForbiddenException('You can only cancel sales for your branch');
+    }
+    if (sale.status === SaleStatus.COMPLETED) {
+      throw new BadRequestException('Cannot cancel a completed sale. Use returns/refunds instead.');
+    }
+    if (sale.status === SaleStatus.CANCELLED) {
+      return sale;
+    }
+    return this.prisma.sale.update({
+      where: { id },
+      data: {
+        status: SaleStatus.CANCELLED,
+        notes: (sale.notes ? `${sale.notes} | ` : '') + `Cancelled by ${user.email || user.userId}`,
+      },
+    });
+  }
+
   async findAll(query: {
     branchId?: string;
     startDate?: string;
@@ -400,7 +682,7 @@ const derivedPaymentProvider: PaymentProvider =
   }) {
     const { branchId, startDate, endDate, type, search, user } = query;
     const where: any = {
-      status: { not: 'RETURNED' }
+      status: { not: 'RETURNED' },
     };
 
     if (branchId) {

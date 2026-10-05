@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, Param, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Body, Param, Query, UseGuards } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { SalesService } from './sales.service';
 import { CreateSaleDto } from './dto/create-sale.dto';
@@ -16,10 +16,17 @@ export class SalesController {
   constructor(private salesService: SalesService) {}
 
   @Post()
-  @Roles(UserRole.BRANCH_MANAGER)
-  @ApiOperation({ summary: 'Create new sale (Branch Manager only)' })
+  @Roles(UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER)
+  @ApiOperation({ summary: 'Create new sale' })
   async create(@Body() createSaleDto: CreateSaleDto, @GetUser() user: any) {
     return this.salesService.create(createSaleDto, user);
+  }
+
+  @Patch(':id/cancel')
+  @Roles(UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER)
+  @ApiOperation({ summary: 'Cancel a pending sale' })
+  async cancel(@Param('id') id: string, @GetUser() user: any) {
+    return this.salesService.cancel(id, user);
   }
 
   @Get()

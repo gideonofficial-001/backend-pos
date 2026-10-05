@@ -51,6 +51,11 @@ class SalePaymentDto {
   @IsOptional()
   @IsString()
   mpesaRef?: string;
+
+  @ApiProperty({ required: false, description: 'Customer phone number for M-Pesa STK push' })
+  @IsOptional()
+  @IsString()
+  phoneNumber?: string;
 }
 
 export class CreateSaleDto {
@@ -96,4 +101,18 @@ export class CreateSaleDto {
   @IsOptional()
   @IsString()
   idempotencyKey?: string;
+
+  @ApiProperty({ required: false, description: 'True if sale is pending M-Pesa STK push callback' })
+  @IsOptional()
+  isStkPending?: boolean;
+
+  @ApiProperty({ required: false, description: 'Reason for discounts applied' })
+  @IsOptional()
+  @IsString()
+  discountReason?: string;
+
+  @ApiProperty({ required: false, description: 'Admin/Manager authorization code for high discounts' })
+  @IsOptional()
+  @IsString()
+  managerOverrideCode?: string;
 }

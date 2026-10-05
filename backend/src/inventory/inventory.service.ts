@@ -556,6 +556,18 @@ export class InventoryService {
     return result;
   }
 
+  async getAvailableCylinders(branchId: string, productId: string, status?: string) {
+    if (!branchId || !productId) return [];
+    return this.prisma.cylinder.findMany({
+      where: {
+        branchId,
+        productId,
+        ...(status ? { status: status as any } : { status: 'FULL' }),
+      },
+      orderBy: { serialNumber: 'asc' },
+    });
+  }
+
   async delete(id: string) {
     try {
       // First check that the inventory record exists

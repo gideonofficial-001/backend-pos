@@ -89,6 +89,8 @@ enum AuditAction {
   BRANCH_UPDATED
   TRANSFER_CREATED
   TRANSFER_CANCELLED
+  DISCOUNT_APPLIED
+  BRANCH_CLOSING_SUBMITTED
 }
 
 enum ExpenseCategory {
@@ -448,6 +450,8 @@ model Sale {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  idempotencyKey String? @unique
+
   payments  SalePayment[]
 
   @@map("sales")
@@ -481,6 +485,9 @@ model SaleItem {
   total     Decimal @db.Decimal(10, 2)
 
   lpgVariant LpgSaleVariant?
+
+  cylinderId String?
+  cylinder   Cylinder? @relation(fields: [cylinderId], references: [id])
 
   @@map("sale_items")
 }
@@ -675,6 +682,7 @@ model Cylinder {
   condition    CylinderCondition @default(GOOD)
 
   transferItems TransferItem[]
+  saleItems     SaleItem[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

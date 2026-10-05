@@ -29,57 +29,92 @@ export class BranchClosingsService {
       },
     });
 
-    // Calculate today's sales from SalePayment
-    const sales = await this.prisma.sale.findMany({
+    // 1. Calculate today's cash received through SalePayment records
+    // This accurately includes cash from today's cash sales AND cash received on invoice debt payments today!
+    const paymentsToday = await this.prisma.salePayment.findMany({
       where: {
-        branchId,
         createdAt: { gte: today },
-        status: 'COMPLETED',
+        sale: { branchId, status: 'COMPLETED' },
       },
-      include: { payments: true },
+      select: { method: true, amount: true, saleId: true },
     });
 
     let cashSales = 0;
     let mpesaSales = 0;
-    let invoiceSales = 0;
 
-    for (const s of sales) {
-      if (s.type === 'INVOICE') {
-        invoiceSales += Number(s.total);
-      }
-      if (s.payments && s.payments.length > 0) {
-        for (const p of s.payments) {
-          if (p.method === 'CASH') cashSales += Number(p.amount);
-          else if (p.method === 'MPESA') mpesaSales += Number(p.amount);
-        }
-      } else {
-        if (s.paymentProvider === 'MPESA') mpesaSales += Number(s.total);
-        else if (s.paymentProvider === 'CASH') cashSales += Number(s.total);
+    for (const p of paymentsToday) {
+      if (p.method === 'CASH') {
+        cashSales += Number(p.amount);
+      } else if (p.method === 'MPESA') {
+        mpesaSales += Number(p.amount);
       }
     }
 
-    // Calculate today's branch expenses
+    // Fallback for legacy sales created today that might not have SalePayment rows
+    const legacySales = await this.prisma.sale.findMany({
+      where: {
+        branchId,
+        createdAt: { gte: today },
+        status: 'COMPLETED',
+        type: { not: 'INVOICE' },
+        payments: { none: {} },
+      },
+      select: { paymentProvider: true, total: true },
+    });
+
+    for (const s of legacySales) {
+      if (s.paymentProvider === 'MPESA') {
+        mpesaSales += Number(s.total);
+      } else if (s.paymentProvider === 'CASH') {
+        cashSales += Number(s.total);
+      }
+    }
+
+    // 2. Invoice sales issued today (debt created, not cash in drawer)
+    const invoiceSalesToday = await this.prisma.sale.findMany({
+      where: {
+        branchId,
+        type: 'INVOICE',
+        createdAt: { gte: today },
+        status: 'COMPLETED',
+      },
+      select: { total: true },
+    });
+    const invoiceSales = invoiceSalesToday.reduce((sum, s) => sum + Number(s.total), 0);
+
+    // 3. Approved cash expenses today
     const expenses = await this.prisma.expense.findMany({
       where: {
         branchId,
         createdAt: { gte: today },
-        status: { in: ['APPROVED', 'PENDING'] },
+        status: 'APPROVED',
       },
     });
     const totalExpenses = expenses.reduce((sum, e) => sum + Number(e.amount), 0);
 
+    // 4. Approved cash refunds today
+    const refunds = await this.prisma.return.findMany({
+      where: {
+        branchId,
+        approvedAt: { gte: today },
+        status: 'APPROVED',
+      },
+    });
+    const totalRefunds = refunds.reduce((sum, r) => sum + Number(r.refundAmount || 0), 0);
+
     const openingCash = existing ? Number(existing.openingCash) : 0;
-    const expectedCash = openingCash + cashSales - totalExpenses;
+    const expectedCash = Math.round((openingCash + cashSales - totalExpenses - totalRefunds) * 100) / 100;
 
     return {
       date: today,
       existingClosing: existing,
       calculated: {
         openingCash,
-        cashSales,
-        mpesaSales,
-        invoiceSales,
-        totalExpenses,
+        cashSales: Math.round(cashSales * 100) / 100,
+        mpesaSales: Math.round(mpesaSales * 100) / 100,
+        invoiceSales: Math.round(invoiceSales * 100) / 100,
+        totalExpenses: Math.round(totalExpenses * 100) / 100,
+        totalRefunds: Math.round(totalRefunds * 100) / 100,
         expectedCash,
       },
     };
@@ -98,11 +133,18 @@ export class BranchClosingsService {
     const cashSales = summary.calculated.cashSales;
     const mpesaSales = summary.calculated.mpesaSales;
     const totalExpenses = summary.calculated.totalExpenses;
+    const totalRefunds = summary.calculated.totalRefunds;
 
-    const expectedCash = openingCash + cashSales - totalExpenses;
-    const variance = closingCash - expectedCash;
+    const expectedCash = Math.round((openingCash + cashSales - totalExpenses - totalRefunds) * 100) / 100;
+    const variance = Math.round((closingCash - expectedCash) * 100) / 100;
 
-    return this.prisma.branchClosing.upsert({
+    if (variance !== 0 && (!data.notes || !data.notes.trim())) {
+      throw new BadRequestException(
+        `A note/reason is required explaining the cash variance of KES ${variance.toFixed(2)}.`,
+      );
+    }
+
+    const closing = await this.prisma.branchClosing.upsert({
       where: {
         branchId_date: { branchId, date: today },
       },
@@ -112,7 +154,7 @@ export class BranchClosingsService {
         openingCash,
         cashSales,
         mpesaSales,
-        totalExpenses,
+        totalExpenses: totalExpenses + totalRefunds,
         closingCash,
         expectedCash,
         variance,
@@ -123,7 +165,7 @@ export class BranchClosingsService {
         openingCash,
         cashSales,
         mpesaSales,
-        totalExpenses,
+        totalExpenses: totalExpenses + totalRefunds,
         closingCash,
         expectedCash,
         variance,
@@ -134,6 +176,32 @@ export class BranchClosingsService {
         submittedBy: { select: { firstName: true, lastName: true } },
       },
     });
+
+    // Record audit log
+    await this.prisma.auditLog.create({
+      data: {
+        userId: user.userId,
+        action: 'BRANCH_CLOSING_SUBMITTED' as any,
+        entityType: 'BranchClosing',
+        entityId: closing.id,
+        description: `Branch closing submitted for ${branchId} on ${today.toISOString().split('T')[0]}: Expected KES ${expectedCash.toFixed(2)}, Actual KES ${closingCash.toFixed(2)}, Variance KES ${variance.toFixed(2)}`,
+        newValues: {
+          branchId,
+          date: today,
+          openingCash,
+          cashSales,
+          mpesaSales,
+          totalExpenses,
+          totalRefunds,
+          closingCash,
+          expectedCash,
+          variance,
+          notes: data.notes || '',
+        },
+      },
+    });
+
+    return closing;
   }
 
   async getHistory(branchId?: string, startDate?: string, endDate?: string) {

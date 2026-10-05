@@ -5,6 +5,7 @@ import { NotificationsModule } from '../notifications/notifications.module';
 import { AuditLogsModule } from '../audit-logs/audit-logs.module';
 import { PrismaModule } from '../prisma/prisma.module';
 import { TransfersModule } from '../transfers/transfers.module';
+import { MpesaModule } from '../mpesa/mpesa.module';
 
 @Module({
   imports: [
@@ -12,6 +13,7 @@ import { TransfersModule } from '../transfers/transfers.module';
     AuditLogsModule, 
     PrismaModule,
     TransfersModule,
+    MpesaModule,
   ],
   providers: [SalesService],
   controllers: [SalesController],

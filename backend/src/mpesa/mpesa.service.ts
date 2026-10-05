@@ -4,6 +4,14 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { ConfigService } from '@nestjs/config';
+import {
+  ProductType,
+  LpgSaleVariant,
+  MovementType,
+  SaleStatus,
+  PaymentProvider,
+  AuditAction,
+} from '@prisma/client';
 import axios from 'axios';
 
 @Injectable()
@@ -159,6 +167,20 @@ export class MpesaService {
     });
     if (!transaction) throw new NotFoundException('Transaction not found');
 
+    let sale: any = null;
+    if (transaction.saleId) {
+      sale = await this.prisma.sale.findUnique({
+        where: { id: transaction.saleId },
+        include: {
+          saleItems: { include: { product: true } },
+          payments: true,
+          branch: true,
+          user: { select: { id: true, firstName: true, lastName: true } },
+          customer: true,
+        },
+      });
+    }
+
     return {
       status:        transaction.status,
       receiptNumber: transaction.receiptNumber,
@@ -166,6 +188,7 @@ export class MpesaService {
       resultDesc:    transaction.resultDesc    ?? null,
       amount:        transaction.amount,
       phoneNumber:   transaction.phoneNumber,
+      sale,
     };
   }
 
@@ -244,9 +267,21 @@ export class MpesaService {
 
     // ── Payment failed or cancelled by user ───────────────────────────────
     if (ResultCode !== 0) {
-      await this.prisma.mpesaTransaction.update({
-        where: { id: transaction.id },
-        data:  { status: 'FAILED', resultDesc: ResultDesc },
+      await this.prisma.$transaction(async (tx) => {
+        await tx.mpesaTransaction.update({
+          where: { id: transaction.id },
+          data:  { status: 'FAILED', resultDesc: ResultDesc },
+        });
+
+        if (transaction.saleId) {
+          await tx.sale.update({
+            where: { id: transaction.saleId },
+            data: {
+              status: SaleStatus.CANCELLED,
+              notes: ResultDesc ? `M-Pesa STK failed: ${ResultDesc}` : 'M-Pesa STK failed or cancelled',
+            },
+          });
+        }
       });
       this.logger.log(`Transaction ${CheckoutRequestID} failed: ${ResultDesc}`);
       return { message: 'Failed transaction recorded' };
@@ -268,8 +303,8 @@ export class MpesaService {
     const lastName    = meta.find((i: any) => i.Name === 'LastName')?.Value   || '';
     const customerName = [firstName, middleName, lastName].filter(Boolean).join(' ').trim() || null;
 
-    // ✅ Fix 3: all DB updates inside a single Prisma transaction
-    // If any step fails, all changes roll back — no partial financial state
+    // ✅ All DB updates inside a single Prisma interactive transaction
+    // Guarantees: payment completed + stock deducted + sale completed + movements created atomically
     await this.prisma.$transaction(async (tx) => {
       // 1. Mark M-Pesa transaction as completed
       await tx.mpesaTransaction.update({
@@ -282,13 +317,200 @@ export class MpesaService {
         },
       });
 
-      // 2. Update linked sale if present
+      // 2. Finalize linked sale atomically
       if (transaction.saleId) {
-        await tx.sale.update({
+        const sale = await tx.sale.findUnique({
           where: { id: transaction.saleId },
-          data:  { status: 'COMPLETED' },
+          include: {
+            saleItems: { include: { product: true } },
+            payments: true,
+          },
         });
-        this.logger.log(`Sale ${transaction.saleId} marked COMPLETED via M-Pesa (${receiptNumber})`);
+
+        if (sale && sale.status === SaleStatus.PENDING) {
+          // A. Atomic Stock Deduction for each item
+          for (const item of sale.saleItems) {
+            const product = item.product;
+            const variant = item.lpgVariant;
+            let quantityDelta = -item.quantity;
+
+            if (product.type === ProductType.LPG_REFILL) {
+              if (variant === LpgSaleVariant.REFILL) {
+                const res = await tx.inventory.updateMany({
+                  where: {
+                    branchId: sale.branchId,
+                    productId: item.productId,
+                    fullCylinders: { gte: item.quantity },
+                  },
+                  data: {
+                    fullCylinders: { decrement: item.quantity },
+                    totalSold: { increment: item.quantity },
+                  },
+                });
+                if (res.count !== 1) {
+                  throw new BadRequestException(`Insufficient full cylinders for ${product.name}`);
+                }
+                quantityDelta = 0;
+              } else if (variant === LpgSaleVariant.EMPTY_SHELL) {
+                const res = await tx.inventory.updateMany({
+                  where: {
+                    branchId: sale.branchId,
+                    productId: item.productId,
+                    quantity: { gte: item.quantity },
+                  },
+                  data: {
+                    quantity: { decrement: item.quantity },
+                    totalSold: { increment: item.quantity },
+                  },
+                });
+                if (res.count !== 1) {
+                  throw new BadRequestException(`Insufficient empty shells for ${product.name}`);
+                }
+              } else if (variant === LpgSaleVariant.COMPLETE_SET) {
+                const res = await tx.inventory.updateMany({
+                  where: {
+                    branchId: sale.branchId,
+                    productId: item.productId,
+                    quantity: { gte: item.quantity },
+                    fullCylinders: { gte: item.quantity },
+                  },
+                  data: {
+                    quantity: { decrement: item.quantity },
+                    fullCylinders: { decrement: item.quantity },
+                    totalSold: { increment: item.quantity },
+                  },
+                });
+                if (res.count !== 1) {
+                  throw new BadRequestException(`Insufficient complete sets for ${product.name}`);
+                }
+              }
+            } else if (product.type === ProductType.LPG_CYLINDER) {
+              const res = await tx.inventory.updateMany({
+                where: {
+                  branchId: sale.branchId,
+                  productId: item.productId,
+                  quantity: { gte: item.quantity },
+                  fullCylinders: { gte: item.quantity },
+                },
+                data: {
+                  quantity: { decrement: item.quantity },
+                  fullCylinders: { decrement: item.quantity },
+                  totalSold: { increment: item.quantity },
+                },
+              });
+              if (res.count !== 1) {
+                throw new BadRequestException(`Insufficient stock for ${product.name}`);
+              }
+            } else {
+              const res = await tx.inventory.updateMany({
+                where: {
+                  branchId: sale.branchId,
+                  productId: item.productId,
+                  quantity: { gte: item.quantity },
+                },
+                data: {
+                  quantity: { decrement: item.quantity },
+                  totalSold: { increment: item.quantity },
+                },
+              });
+              if (res.count !== 1) {
+                throw new BadRequestException(`Insufficient stock for ${product.name}`);
+              }
+            }
+
+            // Optional Serialized Cylinder status transition
+            if (item.cylinderId) {
+              await tx.cylinder.updateMany({
+                where: { id: item.cylinderId, branchId: sale.branchId },
+                data: { status: 'EMPTY' },
+              });
+            }
+
+            const inv = await tx.inventory.findUnique({
+              where: { branchId_productId: { branchId: sale.branchId, productId: item.productId } },
+            });
+
+            if (inv) {
+              await tx.stockMovement.create({
+                data: {
+                  inventoryId: inv.id,
+                  type: MovementType.SALE,
+                  quantity: quantityDelta,
+                  referenceId: sale.id,
+                  referenceType: 'Sale',
+                  performedById: sale.userId,
+                  notes: `Sale ${sale.saleCode}${variant ? ` (${variant})` : ''} via M-Pesa`,
+                },
+              });
+            }
+          }
+
+          // B. Create M-Pesa SalePayment
+          await tx.salePayment.create({
+            data: {
+              saleId: sale.id,
+              method: PaymentProvider.MPESA,
+              amount: transaction.amount,
+              mpesaRef: receiptNumber,
+            },
+          });
+
+          // C. If there was a split payment with CASH in the intent, record it
+          if (Number(sale.total) > Number(transaction.amount)) {
+            const cashPart = Math.round((Number(sale.total) - Number(transaction.amount)) * 100) / 100;
+            await tx.salePayment.create({
+              data: {
+                saleId: sale.id,
+                method: PaymentProvider.CASH,
+                amount: cashPart,
+              },
+            });
+          }
+
+          // D. Customer total purchases increment
+          if (sale.customerId) {
+            await tx.customer.update({
+              where: { id: sale.customerId },
+              data: { totalPurchases: { increment: sale.total } },
+            });
+          }
+
+          // E. Mark Sale COMPLETED
+          await tx.sale.update({
+            where: { id: sale.id },
+            data: {
+              status: SaleStatus.COMPLETED,
+              mpesaRef: receiptNumber,
+              paymentProvider: PaymentProvider.MPESA,
+            },
+          });
+
+          // F. Audit log & activity feed
+          await tx.auditLog.create({
+            data: {
+              userId: sale.userId,
+              action: AuditAction.SALE_COMPLETED,
+              description: `M-Pesa payment completed for sale ${sale.saleCode} (${receiptNumber}) - KES ${transaction.amount}`,
+              entityType: 'Sale',
+              entityId: sale.id,
+              newValues: { receiptNumber, amount: transaction.amount, customerName },
+            },
+          });
+
+          await tx.activityFeed.create({
+            data: {
+              type: 'SALE_COMPLETED',
+              branchId: sale.branchId,
+              title: 'Sale Completed (M-Pesa)',
+              message: `Sale ${sale.saleCode} completed via M-Pesa ${receiptNumber} for KES ${sale.total}`,
+              entityId: sale.id,
+              entityType: 'Sale',
+              visibleToBranch: true,
+            },
+          });
+
+          this.logger.log(`Sale ${sale.id} (${sale.saleCode}) atomically finalized via M-Pesa (${receiptNumber})`);
+        }
       }
 
       // 3. Update linked invoice if present
@@ -306,6 +528,24 @@ export class MpesaService {
               paidAt:     newBalance <= 0 ? new Date() : null,
             },
           });
+
+          if (invoice.customerId) {
+            await tx.customer.update({
+              where: { id: invoice.customerId },
+              data: { creditUsed: { decrement: Number(amountPaid || transaction.amount) } },
+            });
+          }
+
+          if (invoice.saleId) {
+            await tx.salePayment.create({
+              data: {
+                saleId: invoice.saleId,
+                method: PaymentProvider.MPESA,
+                amount: amountPaid || transaction.amount,
+                mpesaRef: receiptNumber,
+              },
+            });
+          }
         }
       }
     });

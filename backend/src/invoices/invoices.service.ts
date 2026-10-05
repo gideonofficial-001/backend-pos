@@ -161,6 +161,24 @@ export class InvoicesService {
       },
     });
 
+    await this.prisma.auditLog.create({
+      data: {
+        userId: performedById,
+        action: 'INVOICE_PAID' as any,
+        entityType: 'Invoice',
+        entityId: updatedInvoice.id,
+        description: `Payment of KES ${amount.toFixed(2)} (${paymentMethod}${mpesaRef ? ` - ${mpesaRef}` : ''}) recorded for Invoice ${updatedInvoice.invoiceCode}`,
+        newValues: {
+          invoiceId: updatedInvoice.id,
+          invoiceCode: updatedInvoice.invoiceCode,
+          amountPaid: amount,
+          balance: newBalance,
+          paymentMethod,
+          mpesaRef: mpesaRef || null,
+        },
+      },
+    });
+
     return updatedInvoice;
   }
 
