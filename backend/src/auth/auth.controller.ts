@@ -54,6 +54,24 @@ export class AuthController {
     });
   }
 
+  @Post('logout-other-sessions')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Logout all other active sessions' })
+  async logoutOtherSessions(
+    @GetUser('userId') userId: string,
+    @Ip() ipAddress: string,
+    @Req() req: any,
+  ) {
+    const realIp =
+      (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
+      ipAddress ||
+      req.ip ||
+      'unknown';
+    const userAgent = (req.headers && req.headers['user-agent']) || 'unknown';
+    return this.authService.logoutOtherSessions(userId, realIp, userAgent);
+  }
+
   @Post('logout')
   @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
