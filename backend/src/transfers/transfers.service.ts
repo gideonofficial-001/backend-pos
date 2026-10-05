@@ -15,9 +15,22 @@ interface AuthUser {
   branchId?: string;
 }
 
+function isProductLpg(product: any, item?: any): boolean {
+  if (item?.lpgComponent) return true;
+  if (!product) return false;
+  return !!(
+    product.isCylinderTracked ||
+    product.isLpg ||
+    product.type === 'LPG_REFILL' ||
+    product.type === 'LPG_CYLINDER' ||
+    product.category?.name?.toUpperCase().includes('LPG') ||
+    product.name?.toLowerCase().includes('kg')
+  );
+}
+
 // 🚀 FIXED: Better labels for internal activity feeds and notifications
 function itemLabel(item: any): string {
-  const isLpg = item.product?.isCylinderTracked || item.product?.isLpg;
+  const isLpg = isProductLpg(item.product, item);
   if (isLpg) {
     if (item.lpgComponent === 'REFILL') return `${item.product.name} (Gas Refill) x${item.quantity}`;
     if (item.lpgComponent === 'CYLINDER') return `${item.product.name} (Complete Set) x${item.quantity}`;
@@ -67,31 +80,31 @@ export class TransfersService {
 
       const inventory = await this.prisma.inventory.findUnique({
         where: { branchId_productId: { branchId: fromBranchId, productId: item.productId } },
-        include: { product: true },
+        include: { product: { include: { category: true } } },
       });
 
       if (!inventory) throw new BadRequestException(`Product not found in source branch inventory`);
 
       const variant = item.variant ?? 'STANDARD';
-      const isLpg = inventory.product.isCylinderTracked || inventory.product.isLpg;
+      const isLpg = isProductLpg(inventory.product) || inventory.fullCylinders != null;
       let lpgComponent: LpgComponent | undefined = undefined;
 
       if (isLpg) {
         if (variant === 'CYLINDER') {
           const available = inventory.fullCylinders ?? 0;
-          if (available < item.quantity) throw new BadRequestException(`Insufficient full cylinders. Available: ${available}`);
+          if (available < item.quantity) throw new BadRequestException(`Insufficient full cylinders for ${inventory.product.name}. Available: ${available}`);
           lpgComponent = LpgComponent.CYLINDER;
         } else if (variant === 'REFILL') {
           const available = inventory.fullCylinders ?? 0;
-          if (available < item.quantity) throw new BadRequestException(`Insufficient gas refills. Available: ${available}`);
+          if (available < item.quantity) throw new BadRequestException(`Insufficient gas refills for ${inventory.product.name}. Available: ${available}`);
           lpgComponent = LpgComponent.REFILL;
         } else if (variant === 'EMPTY_SHELL') {
           const empties = (inventory.quantity || 0) - (inventory.fullCylinders ?? 0);
-          if (empties < item.quantity) throw new BadRequestException(`Insufficient empty shells. Available: ${empties}`);
+          if (empties < item.quantity) throw new BadRequestException(`Insufficient empty shells for ${inventory.product.name}. Available: ${empties}`);
         }
       } else {
         if (inventory.quantity < item.quantity) {
-          throw new BadRequestException(`Insufficient stock. Available: ${inventory.quantity}`);
+          throw new BadRequestException(`Insufficient stock for ${inventory.product.name}. Available: ${inventory.quantity}`);
         }
       }
 
@@ -242,7 +255,7 @@ export class TransfersService {
 
   private async applyItemStockMovement(tx: any, transfer: any, item: any, performedById: string) {
     const lpgComponent = item.lpgComponent;
-    const isLpg = item.product?.isCylinderTracked || item.product?.isLpg;
+    const isLpg = isProductLpg(item.product, item);
 
     // ── Deduct from sender ────────────────────────────────────────────────
     const sourceInv = await tx.inventory.findUnique({
@@ -251,15 +264,17 @@ export class TransfersService {
 
     if (sourceInv) {
       let updateData: any = {};
+      const currentFull = sourceInv.fullCylinders ?? 0;
 
       if (isLpg) {
         if (lpgComponent === LpgComponent.CYLINDER) {
           updateData.quantity = { decrement: item.quantity };
-          updateData.fullCylinders = { decrement: item.quantity };
+          updateData.fullCylinders = Math.max(0, currentFull - item.quantity);
         } else if (lpgComponent === LpgComponent.REFILL) {
-          updateData.fullCylinders = { decrement: item.quantity };
+          updateData.fullCylinders = Math.max(0, currentFull - item.quantity);
         } else {
           updateData.quantity = { decrement: item.quantity };
+          if (sourceInv.fullCylinders == null) updateData.fullCylinders = 0;
         }
       } else {
         updateData.quantity = { decrement: item.quantity };
@@ -286,15 +301,17 @@ export class TransfersService {
 
     if (destInv) {
       let updateData: any = {};
+      const currentFull = destInv.fullCylinders ?? 0;
 
       if (isLpg) {
         if (lpgComponent === LpgComponent.CYLINDER) {
           updateData.quantity = { increment: item.quantity };
-          updateData.fullCylinders = { increment: item.quantity };
+          updateData.fullCylinders = currentFull + item.quantity;
         } else if (lpgComponent === LpgComponent.REFILL) {
-          updateData.fullCylinders = { increment: item.quantity };
+          updateData.fullCylinders = currentFull + item.quantity;
         } else {
           updateData.quantity = { increment: item.quantity };
+          if (destInv.fullCylinders == null) updateData.fullCylinders = 0;
         }
       } else {
         updateData.quantity = { increment: item.quantity };

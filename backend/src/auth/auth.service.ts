@@ -320,14 +320,19 @@ export class AuthService {
     };
     const access_token = this.jwtService.sign(payload);
 
-    await this.auditLogsService.create({
-      userId,
-      action: 'LOGOUT_ALL_SESSIONS',
-      entityType: 'USER',
-      description: 'User revoked all other sessions',
-      ipAddress,
-      userAgent,
-    });
+    try {
+      await this.auditLogsService.create({
+        userId,
+        action: 'LOGOUT',
+        entityType: 'USER',
+        entityId: userId,
+        description: 'User revoked all other sessions',
+        ipAddress,
+        userAgent,
+      });
+    } catch (err: any) {
+      this.logger.warn(`Failed to create audit log for logout other sessions: ${err?.message}`);
+    }
 
     return { access_token, message: 'All other sessions have been logged out.' };
   }

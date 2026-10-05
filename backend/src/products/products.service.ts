@@ -12,8 +12,31 @@ export class ProductsService {
   ) {}
 
   async create(createProductDto: CreateProductDto, performedBy: string) {
+    let isLpg =
+      createProductDto.type === 'LPG_REFILL' ||
+      createProductDto.type === 'LPG_CYLINDER' ||
+      createProductDto.isLpg === true ||
+      createProductDto.isCylinderTracked === true;
+
+    if (!isLpg && createProductDto.categoryId) {
+      const category = await this.prisma.productCategory.findUnique({
+        where: { id: createProductDto.categoryId },
+      });
+      if (category?.name?.toUpperCase().includes('LPG')) {
+        isLpg = true;
+      }
+    }
+
+    const productData: any = {
+      ...createProductDto,
+      isLpg: isLpg || createProductDto.isLpg || false,
+      isCylinderTracked: isLpg || createProductDto.isCylinderTracked || false,
+      hasRefill: isLpg || createProductDto.hasRefill || false,
+      hasCylinder: isLpg || createProductDto.hasCylinder || false,
+    };
+
     const product = await this.prisma.product.create({
-      data: createProductDto,
+      data: productData,
       include: { category: true },
     });
 
@@ -25,6 +48,7 @@ export class ProductsService {
         branchId: branch.id,
         productId: product.id,
         quantity: 0,
+        fullCylinders: isLpg ? 0 : null,
         minimumQuantity: product.minStockLevel || 10,
       }));
 
@@ -37,7 +61,7 @@ export class ProductsService {
       description: `Created product ${product.name} (${product.code}) and initialized inventory across ${branches.length} branches.`,
       entityType: 'Product',
       entityId: product.id,
-      newValues: createProductDto as any,
+      newValues: productData as any,
     });
 
     return product;
@@ -83,9 +107,31 @@ export class ProductsService {
     const product = await this.prisma.product.findUnique({ where: { id } });
     if (!product) throw new NotFoundException('Product not found');
 
+    const isLpg =
+      updateProductDto.type === 'LPG_REFILL' ||
+      updateProductDto.type === 'LPG_CYLINDER' ||
+      updateProductDto.isLpg === true ||
+      updateProductDto.isCylinderTracked === true ||
+      product.isLpg ||
+      product.isCylinderTracked;
+
+    const data: any = { ...updateProductDto };
+    if (isLpg) {
+      data.isLpg = true;
+      data.isCylinderTracked = true;
+      data.hasRefill = true;
+      data.hasCylinder = true;
+
+      // Initialize fullCylinders for any branch where it was null
+      await this.prisma.inventory.updateMany({
+        where: { productId: id, fullCylinders: null },
+        data: { fullCylinders: 0 },
+      });
+    }
+
     const updated = await this.prisma.product.update({
       where: { id },
-      data: updateProductDto,
+      data,
       include: { category: true },
     });
 
@@ -96,7 +142,7 @@ export class ProductsService {
       entityType: 'Product',
       entityId: id,
       oldValues: product as any,
-      newValues: updateProductDto as any,
+      newValues: data as any,
     });
 
     return updated;

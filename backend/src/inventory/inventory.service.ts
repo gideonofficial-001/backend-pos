@@ -12,12 +12,23 @@ export class InventoryService {
   constructor(private prisma: PrismaService) {}
 
   private withComputedEmptyCylinders<
-    T extends { quantity: number; fullCylinders: number | null },
+    T extends { quantity: number; fullCylinders: number | null; product?: any },
   >(item: T) {
+    const isLpg =
+      item.fullCylinders != null ||
+      item.product?.isLpg ||
+      item.product?.isCylinderTracked ||
+      item.product?.type === 'LPG_REFILL' ||
+      item.product?.type === 'LPG_CYLINDER' ||
+      item.product?.category?.name?.toUpperCase().includes('LPG');
+
+    const effectiveFull = isLpg ? (item.fullCylinders ?? 0) : null;
+
     return {
       ...item,
+      fullCylinders: isLpg ? (item.fullCylinders ?? 0) : item.fullCylinders,
       emptyCylinders:
-        item.fullCylinders != null ? item.quantity - item.fullCylinders : null,
+        effectiveFull != null ? Math.max(0, item.quantity - effectiveFull) : null,
     };
   }
 
@@ -74,22 +85,29 @@ export class InventoryService {
   async restock(inventoryId: string, quantity: number, userId: string) {
     const inventory = await this.prisma.inventory.findUnique({
       where: { id: inventoryId },
-      include: { product: true },
+      include: { product: { include: { category: true } } },
     });
     if (!inventory) throw new NotFoundException('Inventory item not found');
+
+    const isLpg =
+      inventory.product.type === 'LPG_REFILL' ||
+      inventory.product.type === 'LPG_CYLINDER' ||
+      inventory.product.isLpg ||
+      inventory.product.isCylinderTracked ||
+      inventory.product.category?.name?.toUpperCase().includes('LPG') ||
+      inventory.fullCylinders != null;
+
+    const currentFull = inventory.fullCylinders ?? 0;
 
     const updated = await this.prisma.inventory.update({
       where: { id: inventoryId },
       data: {
         quantity: { increment: quantity },
-        fullCylinders:
-          inventory.product.type === 'LPG_REFILL'
-            ? { increment: quantity }
-            : undefined,
+        fullCylinders: isLpg ? currentFull + quantity : undefined,
         totalRefilled: { increment: quantity },
         lastRestocked: new Date(),
       },
-      include: { product: true, branch: true },
+      include: { product: { include: { category: true } }, branch: true },
     });
 
     await this.prisma.stockMovement.create({
@@ -112,29 +130,54 @@ export class InventoryService {
   ) {
     const inventory = await this.prisma.inventory.findUnique({
       where: { id: inventoryId },
-      include: { product: true },
+      include: { product: { include: { category: true } } },
     });
     if (!inventory) throw new NotFoundException('Inventory item not found');
 
-    const tracksCylinders = inventory.fullCylinders != null;
+    const isLpg =
+      inventory.product.type === 'LPG_REFILL' ||
+      inventory.product.type === 'LPG_CYLINDER' ||
+      inventory.product.isLpg ||
+      inventory.product.isCylinderTracked ||
+      inventory.product.category?.name?.toUpperCase().includes('LPG') ||
+      inventory.fullCylinders != null ||
+      payload.fullCylinders !== undefined;
+
     const previousQuantity = inventory.quantity;
     const newQuantity = payload.quantity ?? previousQuantity;
-    const newFull = tracksCylinders
-      ? (payload.fullCylinders ?? inventory.fullCylinders!)
-      : undefined;
+    let newFull: number | null | undefined = undefined;
 
-    if (tracksCylinders && newFull! > newQuantity) {
-      throw new BadRequestException(
-        'Full cylinders cannot exceed total shells',
-      );
+    if (isLpg) {
+      newFull = payload.fullCylinders !== undefined ? payload.fullCylinders : (inventory.fullCylinders ?? 0);
+      if (newFull > newQuantity) {
+        throw new BadRequestException(
+          'Full cylinders cannot exceed total shells',
+        );
+      }
+
+      // Self-heal: ensure product has isLpg & isCylinderTracked set
+      if (!inventory.product.isLpg || !inventory.product.isCylinderTracked) {
+        await this.prisma.product.update({
+          where: { id: inventory.productId },
+          data: {
+            isLpg: true,
+            isCylinderTracked: true,
+            hasRefill: true,
+            hasCylinder: true,
+          },
+        });
+      }
     }
 
     const difference = newQuantity - previousQuantity;
 
     const updated = await this.prisma.inventory.update({
       where: { id: inventoryId },
-      data: { quantity: newQuantity, fullCylinders: newFull },
-      include: { product: true, branch: true },
+      data: {
+        quantity: newQuantity,
+        ...(isLpg ? { fullCylinders: newFull } : {}),
+      },
+      include: { product: { include: { category: true } }, branch: true },
     });
 
     await this.prisma.stockMovement.create({
@@ -143,7 +186,7 @@ export class InventoryService {
         type: MovementType.ADJUSTMENT,
         quantity: difference,
         performedById: userId,
-        notes: payload.reason,
+        notes: payload.reason || 'Manual inventory adjustment',
       },
     });
 
@@ -152,7 +195,7 @@ export class InventoryService {
         inventoryId,
         type: difference >= 0 ? 'INCREASE' : 'DECREASE',
         quantity: Math.abs(difference),
-        reason: payload.reason,
+        reason: payload.reason || 'Manual inventory adjustment',
         userId,
       },
     });

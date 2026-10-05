@@ -72,4 +72,19 @@ export class CreateProductDto {
   @IsOptional()
   @IsBoolean()
   isCylinderTracked?: boolean;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @IsBoolean()
+  isLpg?: boolean;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @IsBoolean()
+  hasRefill?: boolean;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @IsBoolean()
+  hasCylinder?: boolean;
 }
