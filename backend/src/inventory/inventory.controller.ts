@@ -67,6 +67,23 @@ export class InventoryController {
     );
   }
 
+  @Get('adjustments')
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER)
+  @ApiOperation({ summary: 'Get manual stock adjustments' })
+  async getStockAdjustments(
+    @Query('branchId') branchId?: string,
+    @Query('startDate') startDate?: string,
+    @Query('endDate') endDate?: string,
+    @Query('search') search?: string,
+  ) {
+    return this.inventoryService.getStockAdjustments({
+      branchId,
+      startDate,
+      endDate,
+      search,
+    });
+  }
+
   @Get(':id')
   @Roles(
     UserRole.SUPER_ADMIN,
