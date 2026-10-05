@@ -373,7 +373,7 @@ export class TransfersService {
 
   private assertIsReceivingManager(transfer: { toBranchId: string }, user: AuthUser) {
     const canRespond =
-      (user.role === UserRole.BRANCH_MANAGER || user.role === UserRole.SUPER_ADMIN || user.role === UserRole.OVERALL_MANAGER) &&
+      (user.role === UserRole.BRANCH_MANAGER || user.role === UserRole.SUPER_ADMIN) &&
       (user.role !== UserRole.BRANCH_MANAGER || user.branchId === transfer.toBranchId);
     
     if (!canRespond)

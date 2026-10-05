@@ -15,33 +15,35 @@ export class TransfersController {
   constructor(private readonly transfersService: TransfersService) {}
 
   @Post()
-  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER, UserRole.BRANCH_MANAGER)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER)
   @ApiOperation({ summary: 'Create a new stock transfer' })
   create(@Body() createTransferDto: CreateTransferDto, @Request() req) {
     return this.transfersService.create(createTransferDto, req.user);
   }
 
   @Get()
+  @Roles(UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER)
   @ApiOperation({ summary: 'Get all transfers for the user branch with optional filtering' })
   findAll(@Request() req, @Query() query: any) {
     return this.transfersService.findAll(req.user.userId, query);
   }
 
   @Get(':id')
+  @Roles(UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER)
   @ApiOperation({ summary: 'Get transfer details' })
   findOne(@Param('id') id: string) {
     return this.transfersService.findOne(id);
   }
 
   @Patch(':id/items/:itemId/approve')
-  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER, UserRole.BRANCH_MANAGER)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER)
   @ApiOperation({ summary: 'Approve a single transfer item' })
   approveItem(@Param('id') id: string, @Param('itemId') itemId: string, @Request() req) {
     return this.transfersService.approveItem(id, itemId, req.user);
   }
 
   @Patch(':id/items/:itemId/reject')
-  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER, UserRole.BRANCH_MANAGER)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER)
   @ApiOperation({ summary: 'Reject a single transfer item' })
   rejectItem(
     @Param('id') id: string,
@@ -53,14 +55,14 @@ export class TransfersController {
   }
 
   @Patch(':id/approve')
-  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER, UserRole.BRANCH_MANAGER)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER)
   @ApiOperation({ summary: 'Approve all pending items in a transfer' })
   approve(@Param('id') id: string, @Request() req) {
     return this.transfersService.approve(id, req.user);
   }
 
   @Patch(':id/reject')
-  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER, UserRole.BRANCH_MANAGER)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER)
   @ApiOperation({ summary: 'Reject all pending items in a transfer' })
   reject(
     @Param('id') id: string,
@@ -71,7 +73,7 @@ export class TransfersController {
   }
 
   @Patch(':id/cancel')
-  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER, UserRole.BRANCH_MANAGER)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER)
   @ApiOperation({ summary: 'Cancel a pending transfer' })
   cancel(@Param('id') id: string, @Request() req) {
     return this.transfersService.cancel(id, req.user);
