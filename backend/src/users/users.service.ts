@@ -65,10 +65,35 @@ export class UsersService {
 
     // Strip the password before returning to the frontend
     const { password: _, ...result } = user;
+
+    if (branchId && role === UserRole.BRANCH_MANAGER) {
+      const targetBranch = await this.prisma.branch.findUnique({ where: { id: branchId } });
+      if (targetBranch && !targetBranch.managerId && targetBranch.code !== 'HQ') {
+        await this.prisma.branch.update({
+          where: { id: branchId },
+          data: { managerId: user.id },
+        });
+      }
+    }
+
     return result;
   }
 
   async findAll() {
+    // Auto-heal: Ensure any user who is set as branch manager has branchId populated
+    const branchesWithManagers = await this.prisma.branch.findMany({
+      where: { managerId: { not: null } },
+      select: { id: true, managerId: true },
+    });
+    for (const b of branchesWithManagers) {
+      if (b.managerId) {
+        await this.prisma.user.updateMany({
+          where: { id: b.managerId, branchId: null },
+          data: { branchId: b.id },
+        });
+      }
+    }
+
     const users = await this.prisma.user.findMany({
       include: {
         branch: { select: { id: true, name: true, code: true } },
@@ -77,8 +102,16 @@ export class UsersService {
       },
       orderBy: { createdAt: 'desc' },
     });
-    // Strip passwords from the list
-    return users.map(({ password, ...user }) => user);
+
+    // Strip passwords from the list and ensure effective branch is populated
+    return users.map(({ password, ...user }) => {
+      const effectiveBranch = user.branch || user.managedBranch;
+      return {
+        ...user,
+        branchId: user.branchId || user.managedBranch?.id,
+        branch: effectiveBranch,
+      };
+    });
   }
 
   async findOne(id: string) {
@@ -98,17 +131,32 @@ export class UsersService {
       throw new NotFoundException('User not found');
     }
 
-    // Strip the password before returning
+    if (!user.branchId && user.managedBranch?.id) {
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: { branchId: user.managedBranch.id },
+      });
+      user.branchId = user.managedBranch.id;
+    }
+
+    const effectiveBranch = user.branch || user.managedBranch;
     const { password, ...result } = user;
-    return result;
+    return {
+      ...result,
+      branchId: user.branchId || user.managedBranch?.id,
+      branch: effectiveBranch,
+    };
   }
 
   async findByEmail(email: string) {
-    return this.prisma.user.findUnique({ where: { email }, include: { branch: true } });
+    return this.prisma.user.findUnique({ where: { email }, include: { branch: true, managedBranch: true } });
   }
 
   async update(id: string, updateUserDto: UpdateUserDto, performedBy: string) {
-    const user = await this.prisma.user.findUnique({ where: { id } });
+    const user = await this.prisma.user.findUnique({
+      where: { id },
+      include: { managedBranch: true },
+    });
     if (!user) {
       throw new NotFoundException('User not found');
     }
@@ -118,6 +166,28 @@ export class UsersService {
       const targetRole = updateUserDto.role || user.role;
       if (branch?.code?.trim().toUpperCase() === 'HQ' && targetRole !== UserRole.SUPER_ADMIN) {
         throw new BadRequestException('Only administrators can be assigned to the Headquarters branch.');
+      }
+    }
+
+    // If branchId is modified:
+    if (updateUserDto.branchId !== undefined) {
+      // If user was managing another branch, clear managerId on that branch
+      if (user.managedBranch && user.managedBranch.id !== updateUserDto.branchId) {
+        await this.prisma.branch.update({
+          where: { id: user.managedBranch.id },
+          data: { managerId: null },
+        });
+      }
+      // If assigned to a new branch as branch manager and branch has no manager, assign as manager
+      if (updateUserDto.branchId) {
+        const targetBranch = await this.prisma.branch.findUnique({ where: { id: updateUserDto.branchId } });
+        const isBranchManager = (updateUserDto.role || user.role) === UserRole.BRANCH_MANAGER;
+        if (targetBranch && !targetBranch.managerId && isBranchManager && targetBranch.code !== 'HQ') {
+          await this.prisma.branch.update({
+            where: { id: updateUserDto.branchId },
+            data: { managerId: id },
+          });
+        }
       }
     }
 
@@ -131,7 +201,10 @@ export class UsersService {
     const updatedUser = await this.prisma.user.update({
       where: { id },
       data: updateData,
-      include: { branch: true },
+      include: {
+        branch: { select: { id: true, name: true, code: true } },
+        managedBranch: { select: { id: true, name: true, code: true } },
+      },
     });
 
     await this.auditLogsService.create({
@@ -144,9 +217,13 @@ export class UsersService {
       newValues: updateUserDto,
     });
 
-    // Strip password from result
+    const effectiveBranch = updatedUser.branch || updatedUser.managedBranch;
     const { password, ...result } = updatedUser;
-    return result;
+    return {
+      ...result,
+      branchId: updatedUser.branchId || updatedUser.managedBranch?.id,
+      branch: effectiveBranch,
+    };
   }
 
   async remove(id: string, performedBy: string, confirmationText: string) {

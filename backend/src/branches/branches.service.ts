@@ -57,6 +57,19 @@ export class BranchesService {
   }
 
   async findAll() {
+    const branchesWithManagers = await this.prisma.branch.findMany({
+      where: { managerId: { not: null } },
+      select: { id: true, managerId: true },
+    });
+    for (const b of branchesWithManagers) {
+      if (b.managerId) {
+        await this.prisma.user.updateMany({
+          where: { id: b.managerId, branchId: null },
+          data: { branchId: b.id },
+        });
+      }
+    }
+
     return this.prisma.branch.findMany({
       include: {
         manager: {
