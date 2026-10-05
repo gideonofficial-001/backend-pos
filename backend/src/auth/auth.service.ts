@@ -43,8 +43,16 @@ export class AuthService {
     // 1. Find user
     const user = await this.prisma.user.findUnique({
       where: { email },
-      include: { branch: true },
+      include: { branch: true, managedBranch: true },
     });
+
+    if (user && !user.branchId && user.managedBranch?.id) {
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: { branchId: user.managedBranch.id },
+      });
+      user.branchId = user.managedBranch.id;
+    }
 
     if (!user) {
       await this.recordFailedLogin(
@@ -441,5 +449,27 @@ export class AuthService {
     } catch (e) {
       this.logger.warn('Could not create suspicious login notification', e);
     }
+  }
+
+  async getProfile(userId: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      include: {
+        branch: { select: { id: true, name: true, code: true, address: true, phone: true } },
+        managedBranch: { select: { id: true, name: true, code: true } },
+      },
+    });
+    if (!user) {
+      throw new UnauthorizedException('User not found');
+    }
+    if (!user.branchId && user.managedBranch?.id) {
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: { branchId: user.managedBranch.id },
+      });
+      user.branchId = user.managedBranch.id;
+    }
+    const { password: _, ...userWithoutPassword } = user;
+    return userWithoutPassword;
   }
 }

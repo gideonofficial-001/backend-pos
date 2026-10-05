@@ -55,6 +55,9 @@ export class TransfersService {
     const toBranchId = data.toBranchId;
     const { items, notes } = data;
 
+    if (user.role !== UserRole.SUPER_ADMIN && !user.branchId) {
+      throw new ForbiddenException('You are not assigned to any branch. Please contact your administrator.');
+    }
     if (!fromBranchId) throw new BadRequestException('Source branch ID is required');
     if (!items || items.length === 0) throw new BadRequestException('At least one product must be included');
     if (fromBranchId === toBranchId) throw new BadRequestException('Source and destination branches cannot be the same');
@@ -70,6 +73,9 @@ export class TransfersService {
 
     if (!sourceBranch) throw new NotFoundException('Source branch not found');
     if (!destBranch) throw new NotFoundException('Destination branch not found');
+    if (sourceBranch.code?.trim().toUpperCase() === 'HQ' && user.role !== UserRole.SUPER_ADMIN) {
+      throw new ForbiddenException('Only administrators can initiate transfers from Headquarters');
+    }
     if (!destBranch.isActive) throw new BadRequestException(`${destBranch.name} is inactive and cannot receive transfers`);
 
     const transferItems: { productId: string; quantity: number; lpgComponent?: LpgComponent }[] = [];

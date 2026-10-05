@@ -32,6 +32,12 @@ export class SalesService {
     const { branchId, type, customerId, items, notes, payments } =
       createSaleDto;
 
+    if (user.role !== UserRole.SUPER_ADMIN && !user.branchId) {
+      throw new ForbiddenException(
+        'You are not assigned to any branch. Please contact your administrator to be assigned a branch.',
+      );
+    }
+
     if (
       user.role === UserRole.BRANCH_MANAGER &&
       user.branchId !== branchId
@@ -39,6 +45,12 @@ export class SalesService {
       throw new ForbiddenException(
         'You can only create sales for your assigned branch',
       );
+    }
+
+    const targetBranch = await this.prisma.branch.findUnique({ where: { id: branchId } });
+    if (!targetBranch) throw new NotFoundException('Branch not found');
+    if (targetBranch.code?.trim().toUpperCase() === 'HQ' && user.role !== UserRole.SUPER_ADMIN) {
+      throw new ForbiddenException('Only administrators have access to manage or record sales for Headquarters.');
     }
 
     if (type === SaleType.INVOICE && !customerId) {

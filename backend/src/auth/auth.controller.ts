@@ -1,4 +1,4 @@
-import { Controller, Post, Body, Headers, Ip, UseGuards, Req } from '@nestjs/common';
+import { Controller, Get, Post, Body, Headers, Ip, UseGuards, Req } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { Request } from 'express';
 import { AuthService } from './auth.service';
@@ -70,6 +70,14 @@ export class AuthController {
       'unknown';
     const userAgent = (req.headers && req.headers['user-agent']) || 'unknown';
     return this.authService.logoutOtherSessions(userId, realIp, userAgent);
+  }
+
+  @Get('me')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Get current user profile and branch status' })
+  async getProfile(@GetUser('userId') userId: string) {
+    return this.authService.getProfile(userId);
   }
 
   @Post('logout')

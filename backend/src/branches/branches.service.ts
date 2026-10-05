@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, ConflictException } from '@nestjs/common';
+import { Injectable, NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { CreateBranchDto } from './dto/create-branch.dto';
@@ -21,6 +21,13 @@ export class BranchesService {
       );
     }
 
+    if (createBranchDto.code?.trim().toUpperCase() === 'HQ') {
+      if (createBranchDto.managerId) {
+        throw new BadRequestException('Headquarters is hardcoded for administrator management only. Managers cannot be assigned to Headquarters.');
+      }
+      delete createBranchDto.managerId;
+    }
+
     const branch = await this.prisma.branch.create({
       data: createBranchDto,
       include: {
@@ -29,6 +36,13 @@ export class BranchesService {
         },
       },
     });
+
+    if (branch.managerId) {
+      await this.prisma.user.update({
+        where: { id: branch.managerId },
+        data: { branchId: branch.id },
+      });
+    }
 
     await this.auditLogsService.create({
       userId: performedBy,
@@ -81,6 +95,28 @@ export class BranchesService {
   async update(id: string, updateBranchDto: UpdateBranchDto, performedBy: string) {
     const branch = await this.prisma.branch.findUnique({ where: { id } });
     if (!branch) throw new NotFoundException('Branch not found');
+
+    if (branch.code?.trim().toUpperCase() === 'HQ') {
+      if (updateBranchDto.managerId) {
+        throw new BadRequestException('Headquarters is hardcoded for administrator management only. Managers cannot be assigned to Headquarters.');
+      }
+      updateBranchDto.managerId = null;
+    }
+
+    if (updateBranchDto.managerId !== undefined) {
+      if (branch.managerId && branch.managerId !== updateBranchDto.managerId) {
+        await this.prisma.user.updateMany({
+          where: { id: branch.managerId, branchId: branch.id },
+          data: { branchId: null },
+        });
+      }
+      if (updateBranchDto.managerId) {
+        await this.prisma.user.update({
+          where: { id: updateBranchDto.managerId },
+          data: { branchId: branch.id },
+        });
+      }
+    }
 
     const updated = await this.prisma.branch.update({
       where: { id },

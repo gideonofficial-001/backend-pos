@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ForbiddenException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ExpenseStatus, UserRole } from '@prisma/client';
@@ -13,6 +13,19 @@ export class ExpensesService {
 
   async create(createExpenseDto: CreateExpenseDto, user: any) {
     const { branchId, amount, category, description, receiptUrl } = createExpenseDto;
+
+    if (user.role !== UserRole.SUPER_ADMIN && !user.branchId) {
+      throw new ForbiddenException('You are not assigned to any branch. Please contact your administrator.');
+    }
+    if (user.role === UserRole.BRANCH_MANAGER && user.branchId !== branchId) {
+      throw new ForbiddenException('You can only submit expenses for your assigned branch');
+    }
+
+    const targetBranch = await this.prisma.branch.findUnique({ where: { id: branchId } });
+    if (!targetBranch) throw new NotFoundException('Branch not found');
+    if (targetBranch.code?.trim().toUpperCase() === 'HQ' && user.role !== UserRole.SUPER_ADMIN) {
+      throw new ForbiddenException('Only administrators can record expenses for Headquarters.');
+    }
 
     const count = await this.prisma.expense.count();
     const expenseCode = `EXP-${String(count + 1).padStart(5, '0')}`;

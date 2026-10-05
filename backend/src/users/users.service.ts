@@ -30,6 +30,13 @@ export class UsersService {
       throw new BadRequestException('Branch ID is required for branch managers');
     }
 
+    if (branchId) {
+      const branch = await this.prisma.branch.findUnique({ where: { id: branchId } });
+      if (branch?.code?.trim().toUpperCase() === 'HQ' && role !== UserRole.SUPER_ADMIN) {
+        throw new BadRequestException('Only administrators can be assigned to the Headquarters branch.');
+      }
+    }
+
     // Encrypt the password
     const hashedPassword = await bcrypt.hash(password, 10);
 
@@ -104,6 +111,14 @@ export class UsersService {
     const user = await this.prisma.user.findUnique({ where: { id } });
     if (!user) {
       throw new NotFoundException('User not found');
+    }
+
+    if (updateUserDto.branchId) {
+      const branch = await this.prisma.branch.findUnique({ where: { id: updateUserDto.branchId } });
+      const targetRole = updateUserDto.role || user.role;
+      if (branch?.code?.trim().toUpperCase() === 'HQ' && targetRole !== UserRole.SUPER_ADMIN) {
+        throw new BadRequestException('Only administrators can be assigned to the Headquarters branch.');
+      }
     }
 
     const updateData: any = { ...updateUserDto };
