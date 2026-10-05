@@ -26,4 +26,9 @@ export class CreateBranchDto {
   @IsOptional()
   @IsString()
   email?: string;
+
+  @ApiProperty({ example: 'user-uuid', required: false })
+  @IsOptional()
+  @IsString()
+  managerId?: string;
 }

@@ -30,5 +30,5 @@ export class UpdateBranchDto {
   @ApiProperty({ required: false })
   @IsOptional()
   @IsString()
-  managerId?: string;
+  managerId?: string | null;
 }
