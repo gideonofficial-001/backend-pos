@@ -14,6 +14,10 @@ export class ExpensesService {
   async create(createExpenseDto: CreateExpenseDto, user: any) {
     const { branchId, amount, category, description, receiptUrl } = createExpenseDto;
 
+    if ((category as any) === 'PETTY_CASH') {
+      throw new BadRequestException('Petty cash is a daily constant allowance configured by the Admin and cannot be manually submitted.');
+    }
+
     if (user.role !== UserRole.SUPER_ADMIN && !user.branchId) {
       throw new ForbiddenException('You are not assigned to any branch. Please contact your administrator.');
     }
@@ -80,7 +84,90 @@ export class ExpensesService {
     return expense;
   }
 
+  async ensureDailyPettyCash(branchId: string) {
+    try {
+      const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Africa/Nairobi',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }).format(new Date());
+      const [year, month, day] = parts.split('-').map(Number);
+      const today = new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
+
+      // 1. Check if sales exist today (skip if zero sales)
+      const saleCount = await this.prisma.sale.count({
+        where: {
+          branchId,
+          createdAt: { gte: today },
+          status: 'COMPLETED',
+        },
+      });
+      if (saleCount === 0) return;
+
+      // 2. Lookup branch manager or user with dailyPettyCash
+      const branch = await this.prisma.branch.findUnique({
+        where: { id: branchId },
+        include: {
+          manager: true,
+          users: { where: { status: 'ACTIVE' } },
+        },
+      });
+      if (!branch) return;
+
+      let pettyCashAmount = 0;
+      let pettyCashUser = branch.manager || null;
+      if (branch.manager && Number(branch.manager.dailyPettyCash || 0) > 0) {
+        pettyCashAmount = Number(branch.manager.dailyPettyCash);
+      } else if (branch.users && branch.users.length > 0) {
+        const mgr = branch.users.find(u => u.role === UserRole.BRANCH_MANAGER && Number(u.dailyPettyCash || 0) > 0)
+          || branch.users.find(u => Number(u.dailyPettyCash || 0) > 0);
+        if (mgr) {
+          pettyCashAmount = Number(mgr.dailyPettyCash || 0);
+          pettyCashUser = mgr;
+        }
+      }
+
+      if (pettyCashAmount <= 0 || !pettyCashUser) return;
+
+      // 3. Check if already recorded today
+      const existing = await this.prisma.expense.findFirst({
+        where: {
+          branchId,
+          category: 'PETTY_CASH' as any,
+          createdAt: { gte: today },
+        },
+      });
+
+      if (!existing) {
+        const dateCode = parts.split('-').join('');
+        const codeSuffix = (branch.code || branchId.slice(0, 4)).toUpperCase();
+        const expenseCode = `PETTY-${codeSuffix}-${dateCode}`;
+
+        await this.prisma.expense.create({
+          data: {
+            expenseCode,
+            branchId,
+            userId: pettyCashUser.id,
+            amount: pettyCashAmount,
+            category: 'PETTY_CASH' as any,
+            description: `Daily constant petty cash allowance (${pettyCashUser.firstName} ${pettyCashUser.lastName})`,
+            status: ExpenseStatus.APPROVED,
+            approvedById: pettyCashUser.id,
+            approvedAt: new Date(),
+          },
+        });
+      }
+    } catch {
+      // Non-blocking
+    }
+  }
+
   async findAll(query?: { branchId?: string; status?: string; user?: any }) {
+    if (query?.branchId) {
+      await this.ensureDailyPettyCash(query.branchId);
+    }
+
     const where: any = {};
     if (query?.branchId) where.branchId = query.branchId;
     if (query?.status) where.status = query.status;

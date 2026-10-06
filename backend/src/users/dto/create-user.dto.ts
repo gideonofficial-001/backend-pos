@@ -1,4 +1,4 @@
-import { IsEmail, IsNotEmpty, IsString, IsOptional, IsEnum } from 'class-validator';
+import { IsEmail, IsNotEmpty, IsString, IsOptional, IsEnum, IsNumber } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 import { UserRole } from '@prisma/client';
 
@@ -37,4 +37,9 @@ export class CreateUserDto {
   @IsOptional()
   @IsString()
   branchId?: string;
+
+  @ApiProperty({ example: 500, required: false })
+  @IsOptional()
+  @IsNumber()
+  dailyPettyCash?: number;
 }

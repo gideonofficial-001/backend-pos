@@ -99,6 +99,7 @@ enum ExpenseCategory {
   REPAIRS
   MISCELLANEOUS
   OTHER
+  PETTY_CASH
 }
 
 enum ExpenseStatus {
@@ -202,6 +203,8 @@ model User {
   branchId      String?
   branch        Branch? @relation("BranchUsers", fields: [branchId], references: [id])
   managedBranch Branch? @relation("BranchManager")
+
+  dailyPettyCash Decimal? @default(0.00) @db.Decimal(10, 2)
 
   lastLoginAt DateTime?
 

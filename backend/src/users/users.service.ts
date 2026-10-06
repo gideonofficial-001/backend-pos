@@ -49,6 +49,7 @@ export class UsersService {
         phone,
         role,
         branchId,
+        dailyPettyCash: createUserDto.dailyPettyCash !== undefined ? createUserDto.dailyPettyCash : 0,
         status: UserStatus.ACTIVE,
       },
       include: { branch: true },

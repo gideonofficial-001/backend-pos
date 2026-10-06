@@ -82,17 +82,95 @@ export class BranchClosingsService {
     });
     const invoiceSales = invoiceSalesToday.reduce((sum, s) => sum + Number(s.total), 0);
 
-    // 3. Approved cash expenses today
-    const expenses = await this.prisma.expense.findMany({
+    // 3. Daily Petty Cash determination & zero-sales skip rule
+    // Lookup branch manager or assigned branch users to find configured petty cash
+    const branch = await this.prisma.branch.findUnique({
+      where: { id: branchId },
+      include: {
+        manager: true,
+        users: { where: { status: 'ACTIVE' } },
+      },
+    });
+
+    let configuredPettyCash = 0;
+    let pettyCashUser = branch?.manager || null;
+
+    if (branch?.manager && Number(branch.manager.dailyPettyCash || 0) > 0) {
+      configuredPettyCash = Number(branch.manager.dailyPettyCash);
+    } else if (branch?.users && branch.users.length > 0) {
+      const mgr = branch.users.find(u => u.role === 'BRANCH_MANAGER' && Number(u.dailyPettyCash || 0) > 0)
+        || branch.users.find(u => Number(u.dailyPettyCash || 0) > 0);
+      if (mgr) {
+        configuredPettyCash = Number(mgr.dailyPettyCash || 0);
+        pettyCashUser = mgr;
+      }
+    }
+
+    const totalSalesVolume = cashSales + mpesaSales + invoiceSales;
+    const hasSalesToday = totalSalesVolume > 0;
+
+    let pettyCashDeducted = 0;
+    let pettyCashSkipped = false;
+
+    if (hasSalesToday && configuredPettyCash > 0) {
+      pettyCashDeducted = configuredPettyCash;
+      pettyCashSkipped = false;
+
+      // Auto-record the constant petty cash expense as APPROVED if not yet recorded today
+      if (pettyCashUser) {
+        const existingPettyExpense = await this.prisma.expense.findFirst({
+          where: {
+            branchId,
+            category: 'PETTY_CASH',
+            createdAt: { gte: today },
+          },
+        });
+
+        if (!existingPettyExpense) {
+          const parts = new Intl.DateTimeFormat('en-CA', {
+            timeZone: 'Africa/Nairobi',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+          }).format(new Date());
+          const dateCode = parts.split('-').join('');
+          const codeSuffix = (branch?.code || branchId.slice(0, 4)).toUpperCase();
+          const expenseCode = `PETTY-${codeSuffix}-${dateCode}`;
+
+          await this.prisma.expense.create({
+            data: {
+              expenseCode,
+              branchId,
+              userId: pettyCashUser.id,
+              amount: configuredPettyCash,
+              category: 'PETTY_CASH',
+              description: `Daily constant petty cash allowance (${pettyCashUser.firstName} ${pettyCashUser.lastName})`,
+              status: 'APPROVED',
+              approvedById: pettyCashUser.id,
+              approvedAt: new Date(),
+            },
+          });
+        }
+      }
+    } else if (!hasSalesToday && configuredPettyCash > 0) {
+      // Rule: If a branch doesn't make sales the whole day, petty cash is NOT deducted (skipped)
+      pettyCashDeducted = 0;
+      pettyCashSkipped = true;
+    }
+
+    // 4. Approved regular expenses today (excluding PETTY_CASH to prevent double-counting)
+    const approvedExpenses = await this.prisma.expense.findMany({
       where: {
         branchId,
         createdAt: { gte: today },
         status: 'APPROVED',
+        category: { not: 'PETTY_CASH' },
       },
     });
-    const totalExpenses = expenses.reduce((sum, e) => sum + Number(e.amount), 0);
+    const regularExpenses = approvedExpenses.reduce((sum, e) => sum + Number(e.amount), 0);
+    const totalExpenses = Math.round((regularExpenses + pettyCashDeducted) * 100) / 100;
 
-    // 4. Approved cash refunds today
+    // 5. Approved cash refunds today
     const refunds = await this.prisma.return.findMany({
       where: {
         branchId,
@@ -113,7 +191,11 @@ export class BranchClosingsService {
         cashSales: Math.round(cashSales * 100) / 100,
         mpesaSales: Math.round(mpesaSales * 100) / 100,
         invoiceSales: Math.round(invoiceSales * 100) / 100,
-        totalExpenses: Math.round(totalExpenses * 100) / 100,
+        regularExpenses: Math.round(regularExpenses * 100) / 100,
+        pettyCash: Math.round(pettyCashDeducted * 100) / 100,
+        pettyCashConfigured: Math.round(configuredPettyCash * 100) / 100,
+        pettyCashSkipped,
+        totalExpenses,
         totalRefunds: Math.round(totalRefunds * 100) / 100,
         expectedCash,
       },

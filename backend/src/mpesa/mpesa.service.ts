@@ -158,14 +158,89 @@ export class MpesaService {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // Proactive Safaricom STK Push query (for instant failure / cancellation detection)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  async querySafaricomStkStatus(checkoutRequestId: string): Promise<any> {
+    if (!this.consumerKey || !this.shortcode || !this.passKey) {
+      return null;
+    }
+    if (checkoutRequestId.startsWith('PENDING_') || checkoutRequestId.startsWith('MANUAL_')) {
+      return null;
+    }
+    try {
+      const token = await this.getAccessToken();
+      const timestamp = this.generateTimestamp();
+      const password = Buffer.from(`${this.shortcode}${this.passKey}${timestamp}`).toString('base64');
+      const response = await axios.post(
+        `${this.baseUrl}/mpesa/stkpushquery/v1/query`,
+        {
+          BusinessShortCode: this.shortcode,
+          Password: password,
+          Timestamp: timestamp,
+          CheckoutRequestID: checkoutRequestId,
+        },
+        { headers: { Authorization: `Bearer ${token}` }, timeout: 4500 },
+      );
+      return response.data;
+    } catch (error: any) {
+      const data = error.response?.data;
+      if (data && (data.ResultCode !== undefined || data.errorCode || data.ResponseCode)) {
+        return data;
+      }
+      return null;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // Status polling (used by frontend)
   // ─────────────────────────────────────────────────────────────────────────
 
   async getTransactionStatus(checkoutRequestId: string) {
-    const transaction = await this.prisma.mpesaTransaction.findUnique({
+    let transaction = await this.prisma.mpesaTransaction.findUnique({
       where: { checkoutRequestId },
     });
     if (!transaction) throw new NotFoundException('Transaction not found');
+
+    // If still pending, query Safaricom live STK query to catch immediate cancellation or insufficient funds
+    if (transaction.status === 'PENDING') {
+      try {
+        const queryRes = await this.querySafaricomStkStatus(checkoutRequestId);
+        if (queryRes && queryRes.ResultCode !== undefined) {
+          const resultCodeStr = String(queryRes.ResultCode);
+          if (resultCodeStr !== '0') {
+            const resultDesc = queryRes.ResultDesc || (
+              resultCodeStr === '1032' ? 'Request cancelled by user' :
+              resultCodeStr === '1' ? 'The balance is insufficient for the transaction' :
+              resultCodeStr === '1037' ? 'DS timeout user cannot be reached' :
+              'Payment failed or was cancelled'
+            );
+
+            await this.prisma.$transaction(async (tx) => {
+              await tx.mpesaTransaction.update({
+                where: { id: transaction.id },
+                data: { status: 'FAILED', resultDesc },
+              });
+
+              if (transaction.saleId) {
+                await tx.sale.update({
+                  where: { id: transaction.saleId },
+                  data: {
+                    status: SaleStatus.CANCELLED,
+                    notes: `M-Pesa STK failed: ${resultDesc}`,
+                  },
+                });
+              }
+            });
+
+            transaction.status = 'FAILED';
+            transaction.resultDesc = resultDesc;
+          }
+        }
+      } catch (err: any) {
+        this.logger.debug(`Live STK query check skipped: ${err?.message}`);
+      }
+    }
 
     let sale: any = null;
     if (transaction.saleId) {
