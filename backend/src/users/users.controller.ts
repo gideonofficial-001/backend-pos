@@ -74,6 +74,13 @@ export class UsersController {
     return this.usersService.getStats();
   }
 
+  @Get('petty-cash/allocations')
+  @Roles(UserRole.SUPER_ADMIN)
+  @ApiOperation({ summary: 'Get petty cash allocations across all branch managers (Admin only)' })
+  async getPettyCashAllocations() {
+    return this.usersService.getPettyCashAllocations();
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   // SELF MANAGEMENT
   // These routes MUST come before /:id
@@ -306,6 +313,21 @@ export class UsersController {
       updateUserDto,
       userId,
     );
+  }
+
+  @Patch(':id/petty-cash')
+  @Roles(UserRole.SUPER_ADMIN)
+  @ApiOperation({
+    summary: 'Update daily petty cash allowance for an individual user (Admin only)',
+  })
+  async setPettyCash(
+    @Param('id') id: string,
+    @Body('dailyPettyCash') dailyPettyCash: number,
+    @Body('amount') amount: number,
+    @GetUser('userId') userId: string,
+  ) {
+    const finalAmount = dailyPettyCash !== undefined ? dailyPettyCash : amount;
+    return this.usersService.setPettyCash(id, finalAmount, userId);
   }
 
   // ─────────────────────────────────────────────────────────────────────────

@@ -16,14 +16,14 @@ export class ExpensesController {
   constructor(private expensesService: ExpensesService) {}
 
   @Post()
-  @Roles(UserRole.BRANCH_MANAGER)
-  @ApiOperation({ summary: 'Submit expense (Branch Manager)' })
+  @Roles(UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER)
+  @ApiOperation({ summary: 'Submit expense (Admin or Branch Manager)' })
   async create(@Body() createExpenseDto: CreateExpenseDto, @GetUser() user: any) {
     return this.expensesService.create(createExpenseDto, user);
   }
 
   @Get()
-  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER, UserRole.BRANCH_MANAGER)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER)
   @ApiOperation({ summary: 'Get all expenses' })
   async findAll(
     @Query('branchId') branchId?: string,

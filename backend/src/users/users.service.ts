@@ -334,4 +334,58 @@ export class UsersService {
 
     return { message: 'Password updated successfully' };
   }
+
+  async setPettyCash(id: string, amount: number, performedBy: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id },
+      include: { branch: true, managedBranch: true },
+    });
+    if (!user) throw new NotFoundException('User not found');
+
+    const cleanAmount = Math.max(0, Number(amount || 0));
+
+    const updated = await this.prisma.user.update({
+      where: { id },
+      data: { dailyPettyCash: cleanAmount },
+      include: {
+        branch: { select: { id: true, name: true, code: true } },
+        managedBranch: { select: { id: true, name: true, code: true } },
+      },
+    });
+
+    await this.auditLogsService.create({
+      userId: performedBy,
+      action: 'USER_UPDATED',
+      description: `Updated daily petty cash allowance for ${user.email} (${user.firstName} ${user.lastName}) to KES ${cleanAmount.toFixed(2)}`,
+      entityType: 'User',
+      entityId: id,
+      oldValues: { dailyPettyCash: Number(user.dailyPettyCash || 0) },
+      newValues: { dailyPettyCash: cleanAmount },
+    });
+
+    const { password: _, ...result } = updated;
+    return result;
+  }
+
+  async getPettyCashAllocations() {
+    const users = await this.prisma.user.findMany({
+      where: {
+        status: UserStatus.ACTIVE,
+      },
+      include: {
+        branch: { select: { id: true, name: true, code: true } },
+        managedBranch: { select: { id: true, name: true, code: true } },
+      },
+      orderBy: [
+        { role: 'asc' },
+        { firstName: 'asc' },
+      ],
+    });
+
+    return users.map(({ password: _, ...u }) => ({
+      ...u,
+      dailyPettyCash: Number(u.dailyPettyCash || 0),
+      effectiveBranch: u.branch || u.managedBranch || null,
+    }));
+  }
 }

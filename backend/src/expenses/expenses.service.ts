@@ -166,6 +166,14 @@ export class ExpensesService {
   async findAll(query?: { branchId?: string; status?: string; user?: any }) {
     if (query?.branchId) {
       await this.ensureDailyPettyCash(query.branchId);
+    } else {
+      const activeBranches = await this.prisma.branch.findMany({
+        where: { isActive: true },
+        select: { id: true },
+      });
+      for (const b of activeBranches) {
+        await this.ensureDailyPettyCash(b.id);
+      }
     }
 
     const where: any = {};
