@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { UserRole, SaleStatus } from '@prisma/client';
 
@@ -25,6 +25,7 @@ export class ReportsService {
       lowStock,
       pendingInvoices,
       recentSales,
+      todaySalesData,
     ] = await Promise.all([
       this.prisma.sale.count({ where }),
       this.prisma.sale.count({ where: { ...where, createdAt: { gte: today } } }),
@@ -47,7 +48,69 @@ export class ReportsService {
           user: { select: { firstName: true, lastName: true } },
         },
       }),
+      this.prisma.sale.findMany({
+        where: { ...where, createdAt: { gte: today }, status: SaleStatus.COMPLETED },
+        include: {
+          saleItems: {
+            include: {
+              product: { select: { type: true, name: true } },
+            },
+          },
+        },
+      }),
     ]);
+
+    let refillQty = 0;
+    let refillRevenue = 0;
+    let completeSetQty = 0;
+    let completeSetRevenue = 0;
+    let emptyShellQty = 0;
+    let emptyShellRevenue = 0;
+    let generalQty = 0;
+    let generalRevenue = 0;
+    let todayDiscount = 0;
+    let todayGross = 0;
+    let todayNet = 0;
+
+    for (const sale of todaySalesData) {
+      todayDiscount += Number(sale.discount || 0);
+      todayGross += Number(sale.subtotal || sale.total || 0);
+      todayNet += Number(sale.total || 0);
+
+      for (const item of sale.saleItems) {
+        const qty = Number(item.quantity || 0);
+        const itemTotal = Number(item.total || 0);
+        const variant = item.variantSnapshot || item.lpgVariant;
+        const isLpg = item.product?.type === 'LPG_REFILL' || item.product?.type === 'LPG_CYLINDER';
+
+        if (variant === 'REFILL') {
+          refillQty += qty;
+          refillRevenue += itemTotal;
+        } else if (variant === 'COMPLETE_SET') {
+          completeSetQty += qty;
+          completeSetRevenue += itemTotal;
+        } else if (variant === 'EMPTY_SHELL') {
+          emptyShellQty += qty;
+          emptyShellRevenue += itemTotal;
+        } else if (isLpg) {
+          refillQty += qty;
+          refillRevenue += itemTotal;
+        } else {
+          generalQty += qty;
+          generalRevenue += itemTotal;
+        }
+      }
+    }
+
+    const todaySummary = {
+      refill: { quantity: refillQty, revenue: refillRevenue },
+      completeSet: { quantity: completeSetQty, revenue: completeSetRevenue },
+      emptyShell: { quantity: emptyShellQty, revenue: emptyShellRevenue },
+      general: { quantity: generalQty, revenue: generalRevenue },
+      totalRevenue: todayGross > 0 ? todayGross : (todayNet + todayDiscount),
+      totalDiscount: todayDiscount,
+      netRevenue: todayNet,
+    };
 
     return {
       totalSales,
@@ -59,6 +122,7 @@ export class ReportsService {
       lowStock,
       pendingInvoices,
       recentSales,
+      todaySummary,
     };
   }
 
@@ -192,5 +256,247 @@ export class ReportsService {
         potentialProfit: totalValue - totalCost,
       },
     };
+  }
+
+  async getLiveDailySales(branchId?: string, dateStr?: string) {
+    const targetDate = dateStr ? new Date(dateStr) : new Date();
+    const startOfDay = new Date(targetDate);
+    startOfDay.setHours(0, 0, 0, 0);
+    const endOfDay = new Date(targetDate);
+    endOfDay.setHours(23, 59, 59, 999);
+
+    const saleWhere: any = {
+      status: SaleStatus.COMPLETED,
+      createdAt: { gte: startOfDay, lte: endOfDay },
+    };
+    if (branchId && branchId !== 'all') {
+      saleWhere.branchId = branchId;
+    }
+
+    const sales = await this.prisma.sale.findMany({
+      where: saleWhere,
+      include: {
+        customer: true,
+        branch: { select: { id: true, name: true } },
+        saleItems: {
+          include: {
+            product: true,
+          },
+        },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const retailItems: any[] = [];
+    const wholesaleItems: any[] = [];
+
+    let retailTotal = 0;
+    let retailDiscountTotal = 0;
+    let retailItemsCount = 0;
+
+    let wholesaleTotal = 0;
+    let wholesaleDiscountTotal = 0;
+    let wholesaleItemsCount = 0;
+
+    for (const sale of sales) {
+      const isRetail = sale.type === 'CASH';
+      const isWholesale = sale.type === 'WHOLESALE';
+
+      for (const item of sale.saleItems) {
+        const qty = item.quantity;
+        const sellingPrice = Number(item.unitPrice);
+        const discount = Number(item.discount || 0);
+        const subtotal = Number(item.total);
+        const markedPrice = isWholesale
+          ? Number(item.product?.wholesalePrice || item.product?.price || sellingPrice)
+          : Number(item.product?.price || sellingPrice);
+
+        const productName = item.productNameSnapshot || item.product?.name || 'Unknown Item';
+        const variant = item.variantSnapshot || item.lpgVariant;
+        const lpgLabel = variant === 'REFILL' ? ' (Refill)' : variant === 'EMPTY_SHELL' ? ' (Empty Shell)' : variant === 'COMPLETE_SET' ? ' (Complete Set)' : '';
+
+        const itemData = {
+          id: item.id,
+          saleId: sale.id,
+          saleCode: sale.saleCode,
+          productId: item.productId,
+          productName: `${productName}${lpgLabel}`,
+          markedPrice,
+          sellingPrice,
+          quantity: qty,
+          discount,
+          subtotal,
+          isRetailSale: isRetail,
+          customerName: sale.customer?.name || (isWholesale ? 'Walk-in Client' : undefined),
+          branchName: sale.branch?.name,
+          createdAt: sale.createdAt,
+        };
+
+        if (isRetail) {
+          retailItems.push(itemData);
+          retailTotal += subtotal;
+          retailDiscountTotal += discount;
+          retailItemsCount += qty;
+        } else if (isWholesale) {
+          wholesaleItems.push(itemData);
+          wholesaleTotal += subtotal;
+          wholesaleDiscountTotal += discount;
+          wholesaleItemsCount += qty;
+        }
+      }
+    }
+
+    // Expenses for the day
+    const expenseWhere: any = {
+      status: 'APPROVED',
+      createdAt: { gte: startOfDay, lte: endOfDay },
+    };
+    if (branchId && branchId !== 'all') {
+      expenseWhere.branchId = branchId;
+    }
+
+    const expenses = await this.prisma.expense.findMany({
+      where: expenseWhere,
+      include: {
+        branch: { select: { name: true } },
+      },
+    });
+
+    const expenseTotal = expenses.reduce((sum, e) => sum + Number(e.amount), 0);
+    const grandTotal = retailTotal + wholesaleTotal;
+    const totalDiscount = retailDiscountTotal + wholesaleDiscountTotal;
+    const netTotal = grandTotal - expenseTotal;
+
+    return {
+      date: startOfDay.toISOString().split('T')[0],
+      branchId: branchId || 'all',
+      retailSales: {
+        items: retailItems,
+        total: retailTotal,
+        discountTotal: retailDiscountTotal,
+        itemsCount: retailItemsCount,
+      },
+      wholesaleSales: {
+        items: wholesaleItems,
+        total: wholesaleTotal,
+        discountTotal: wholesaleDiscountTotal,
+        itemsCount: wholesaleItemsCount,
+      },
+      expenses: {
+        items: expenses.map((e) => ({
+          id: e.id,
+          category: e.category,
+          amount: Number(e.amount),
+          description: e.description,
+          branchName: e.branch?.name,
+        })),
+        total: expenseTotal,
+      },
+      summary: {
+        retailTotal,
+        wholesaleTotal,
+        totalDiscount,
+        grandTotal,
+        expenseTotal,
+        netTotal,
+      },
+    };
+  }
+
+  async archiveDailyReport(branchId: string, dateStr?: string) {
+    if (!branchId || branchId === 'all') {
+      throw new BadRequestException('Branch ID is required to archive a daily report.');
+    }
+    const reportData = await this.getLiveDailySales(branchId, dateStr);
+    const reportDate = new Date(reportData.date);
+
+    // Delete existing archive for this branch and date if any to refresh cleanly
+    await this.prisma.dailyReport.deleteMany({
+      where: {
+        branchId,
+        reportDate,
+      },
+    });
+
+    const created = await this.prisma.dailyReport.create({
+      data: {
+        branchId,
+        reportDate,
+        retailSalesTotal: reportData.summary.retailTotal,
+        retailItemsCount: reportData.retailSales.itemsCount,
+        retailDiscountTotal: reportData.retailSales.discountTotal,
+        wholesaleSalesTotal: reportData.summary.wholesaleTotal,
+        wholesaleItemsCount: reportData.wholesaleSales.itemsCount,
+        expenseTotal: reportData.summary.expenseTotal,
+        grandTotal: reportData.summary.grandTotal,
+        netTotal: reportData.summary.netTotal,
+        isArchived: true,
+        archivedAt: new Date(),
+        salesItems: {
+          create: [
+            ...reportData.retailSales.items.map((i) => ({
+              productId: i.productId,
+              productNameSnapshot: i.productName,
+              saleType: 'CASH' as any,
+              markedPrice: i.markedPrice,
+              sellingPrice: i.sellingPrice,
+              quantity: i.quantity,
+              discount: i.discount,
+              subtotal: i.subtotal,
+              isRetailSale: true,
+            })),
+            ...reportData.wholesaleSales.items.map((i) => ({
+              productId: i.productId,
+              productNameSnapshot: i.productName,
+              customerName: i.customerName,
+              saleType: 'WHOLESALE' as any,
+              markedPrice: i.markedPrice,
+              sellingPrice: i.sellingPrice,
+              quantity: i.quantity,
+              discount: i.discount,
+              subtotal: i.subtotal,
+              isRetailSale: false,
+            })),
+          ],
+        },
+        expenses: {
+          create: reportData.expenses.items.map((e) => ({
+            expenseCategory: e.category,
+            amount: e.amount,
+            description: e.description,
+          })),
+        },
+      },
+      include: {
+        salesItems: true,
+        expenses: true,
+        branch: { select: { name: true } },
+      },
+    });
+
+    return created;
+  }
+
+  async getArchivedReports(branchId?: string, startDate?: string, endDate?: string) {
+    const where: any = { isArchived: true };
+    if (branchId && branchId !== 'all') {
+      where.branchId = branchId;
+    }
+    if (startDate && endDate) {
+      where.reportDate = {
+        gte: new Date(startDate),
+        lte: new Date(endDate),
+      };
+    }
+
+    return this.prisma.dailyReport.findMany({
+      where,
+      include: {
+        branch: { select: { id: true, name: true } },
+        salesItems: true,
+        expenses: true,
+      },
+      orderBy: { reportDate: 'desc' },
+    });
   }
 }

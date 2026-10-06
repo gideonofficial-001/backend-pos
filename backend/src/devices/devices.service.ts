@@ -56,6 +56,7 @@ export class DevicesService {
       city?: string;
       region?: string;
       country?: string;
+      isp?: string;
     },
   ) {
     const existingDevice = await this.prisma.device.findFirst({
@@ -90,6 +91,7 @@ export class DevicesService {
         loginCity:      deviceInfo.city      ?? null,
         loginRegion:    deviceInfo.region    ?? null,
         loginCountry:   deviceInfo.country   ?? null,
+        isp:            deviceInfo.isp       ?? null,
       },
     });
 
@@ -320,6 +322,7 @@ export class DevicesService {
             lastName: true,
             email: true,
             role: true,
+            branch: { select: { name: true } },
           },
         },
         approvedBy: { select: { firstName: true, lastName: true } },

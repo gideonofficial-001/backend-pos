@@ -47,6 +47,13 @@ export class MpesaService {
   // Private helpers
   // ─────────────────────────────────────────────────────────────────────────
 
+  private checkMpesaEnabled() {
+    const enabled = this.configService.get('MPESA_ENABLED');
+    if (enabled === 'false' || enabled === false || !enabled) {
+      throw new BadRequestException('STK Push is temporarily disabled. Please use Cash or PayBill.');
+    }
+  }
+
   private async getAccessToken(): Promise<string> {
     const credentials = Buffer.from(`${this.consumerKey}:${this.consumerSecret}`).toString('base64');
     try {
@@ -84,6 +91,7 @@ export class MpesaService {
     saleId?:     string,
     invoiceId?:  string,
   ) {
+    this.checkMpesaEnabled();
     // Normalize phone
     let formattedPhone = phoneNumber.replace(/\s+/g, '');
     if (formattedPhone.startsWith('0'))  formattedPhone = '254' + formattedPhone.slice(1);
@@ -197,6 +205,7 @@ export class MpesaService {
   // ─────────────────────────────────────────────────────────────────────────
 
   async getTransactionStatus(checkoutRequestId: string) {
+    this.checkMpesaEnabled();
     let transaction = await this.prisma.mpesaTransaction.findUnique({
       where: { checkoutRequestId },
     });

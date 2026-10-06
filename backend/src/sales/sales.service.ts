@@ -140,6 +140,8 @@ export class SalesService {
 
       saleItems.push({
         productId: item.productId,
+        productNameSnapshot: product.name,
+        variantSnapshot: variant ? String(variant) : undefined,
         quantity: item.quantity,
         unitPrice,
         discount: itemDiscount,
@@ -177,117 +179,11 @@ export class SalesService {
       ).join('');
     } while (await this.prisma.sale.findUnique({ where: { saleCode } }));
 
-    // ── 4. STK PUSH LIFECYCLE (PENDING SALE CREATED BEFORE STK) ─────────────
-    const isStk = !!createSaleDto.isStkPending || (
-      payments && payments.some((p) => p.method === PaymentProvider.MPESA && !p.mpesaRef && !!p.phoneNumber)
-    );
-
-    if (isStk) {
-      const mpesaPayment = payments?.find(
-        (p) => p.method === PaymentProvider.MPESA && !!p.phoneNumber,
-      );
-      if (!mpesaPayment) {
-        throw new BadRequestException('A valid phone number is required to initiate M-Pesa STK push');
-      }
-
-      // Pre-validate inventory availability without decrementing yet
-      for (const item of items) {
-        const inventory = await this.prisma.inventory.findUnique({
-          where: { branchId_productId: { branchId, productId: item.productId } },
-          include: { product: true },
-        });
-        if (!inventory) {
-          throw new BadRequestException(`Product not found in branch inventory`);
-        }
-        const variant = this.resolveVariant(inventory.product.type, item.lpgVariant);
-        const availableEmpty = inventory.fullCylinders != null ? inventory.quantity - inventory.fullCylinders : 0;
-        if (variant === LpgSaleVariant.EMPTY_SHELL) {
-          if (availableEmpty < item.quantity) {
-            throw new BadRequestException(`Insufficient empty shells for ${inventory.product.name}. Available: ${availableEmpty}`);
-          }
-        } else if (variant === LpgSaleVariant.REFILL || variant === LpgSaleVariant.COMPLETE_SET || inventory.product.type === ProductType.LPG_CYLINDER) {
-          if ((inventory.fullCylinders ?? 0) < item.quantity) {
-            throw new BadRequestException(`Insufficient full cylinders for ${inventory.product.name}. Available: ${inventory.fullCylinders ?? 0}`);
-          }
-        } else {
-          if (inventory.quantity < item.quantity) {
-            throw new BadRequestException(`Insufficient stock for ${inventory.product.name}. Available: ${inventory.quantity}`);
-          }
-        }
-      }
-
-      // Create PENDING sale (idempotent DB insert)
-      let pendingSale: any;
-      try {
-        pendingSale = await this.prisma.sale.create({
-          data: {
-            saleCode,
-            branchId,
-            userId: user.userId,
-            customerId,
-            type,
-            status: SaleStatus.PENDING,
-            subtotal,
-            discount: totalDiscount,
-            total,
-            paymentProvider: PaymentProvider.MPESA,
-            notes: notes ? `${notes} (Awaiting M-Pesa STK push)` : 'Awaiting M-Pesa STK push',
-            idempotencyKey: createSaleDto.idempotencyKey || null,
-            saleItems: { create: saleItems },
-          },
-          include: {
-            saleItems: { include: { product: true } },
-            payments: true,
-            branch: true,
-            user: { select: { id: true, firstName: true, lastName: true } },
-            customer: true,
-          },
-        });
-      } catch (err: any) {
-        if (err.code === 'P2002' && createSaleDto.idempotencyKey) {
-          return this.prisma.sale.findUnique({
-            where: { idempotencyKey: createSaleDto.idempotencyKey },
-            include: {
-              saleItems: { include: { product: true } },
-              payments: true,
-              branch: true,
-              user: { select: { id: true, firstName: true, lastName: true } },
-              customer: true,
-            },
-          });
-        }
-        throw err;
-      }
-
-      // Trigger STK push linked to this pending sale
-      try {
-        const stkRes = await this.mpesaService.initiateStkPush(
-          mpesaPayment.phoneNumber!,
-          mpesaPayment.amount || total,
-          pendingSale.id,
-        );
-        return {
-          ...pendingSale,
-          checkoutRequestId: stkRes.checkoutRequestId,
-          message: stkRes.message,
-        };
-      } catch (stkErr: any) {
-        await this.prisma.sale.update({
-          where: { id: pendingSale.id },
-          data: {
-            status: SaleStatus.CANCELLED,
-            notes: `Failed to initiate STK push: ${stkErr.message || 'Gateway error'}`,
-          },
-        });
-        throw stkErr;
-      }
-    }
-
-    // ── 5. IMMEDIATE PAYMENT AMOUNT VALIDATION ──────────────────────────────
-    let derivedMpesaRef: string | null = null;
+    // ── 4. PAYMENT AMOUNT VALIDATION & PROCESSING (CASH & PAYBILL ONLY) ────
+    let derivedPaymentRef: string | null = null;
     let finalNotes = notes || '';
     const paymentRecords: any[] = [];
-    let hasMpesa = false;
+    let hasPaybill = false;
 
     if (type !== SaleType.INVOICE) {
       const totalPaid = (payments && payments.length > 0)
@@ -301,7 +197,7 @@ export class SalesService {
       }
 
       const nonCashTotal = payments
-        ? payments.filter((p) => p.method !== PaymentProvider.CASH).reduce((s, p) => s + Number(p.amount || 0), 0)
+        ? payments.filter((p) => String(p.method).toUpperCase() !== 'CASH').reduce((s, p) => s + Number(p.amount || 0), 0)
         : 0;
 
       if (nonCashTotal > total) {
@@ -320,25 +216,29 @@ export class SalesService {
       let remainingToCover = total;
       if (payments && payments.length > 0) {
         for (const p of payments) {
-          if (p.method !== PaymentProvider.CASH && p.amount > 0) {
-            hasMpesa = hasMpesa || p.method === PaymentProvider.MPESA;
-            if (p.method === PaymentProvider.MPESA && p.mpesaRef) {
-              derivedMpesaRef = p.mpesaRef;
-            }
+          const m = String(p.method).toUpperCase();
+          if (m !== 'CASH' && p.amount > 0) {
+            hasPaybill = true;
+            const ref = p.paymentRef || p.mpesaRef || null;
+            if (ref) derivedPaymentRef = ref;
             paymentRecords.push({
-              method: p.method,
+              method: PaymentProvider.PAYBILL,
               amount: p.amount,
-              mpesaRef: p.mpesaRef || null,
+              paymentRef: ref,
+              customerName: p.customerName || createSaleDto.customerName || null,
+              mpesaRef: ref,
             });
             remainingToCover -= p.amount;
           }
         }
-        const cashPayments = payments.filter((p) => p.method === PaymentProvider.CASH);
+        const cashPayments = payments.filter((p) => String(p.method).toUpperCase() === 'CASH');
         if (cashPayments.length > 0) {
           paymentRecords.push({
             method: PaymentProvider.CASH,
             amount: Math.max(0, remainingToCover),
             mpesaRef: null,
+            paymentRef: null,
+            customerName: null,
           });
         }
       } else {
@@ -346,12 +246,14 @@ export class SalesService {
           method: PaymentProvider.CASH,
           amount: total,
           mpesaRef: null,
+          paymentRef: null,
+          customerName: null,
         });
       }
     }
 
-    const derivedPaymentProvider: PaymentProvider = hasMpesa
-      ? PaymentProvider.MPESA
+    const derivedPaymentProvider: PaymentProvider = hasPaybill
+      ? PaymentProvider.PAYBILL
       : PaymentProvider.CASH;
 
     // ── 6. ATOMIC TRANSACTION (Stock Deductions, Payments, Customer Debt) ──
@@ -396,7 +298,7 @@ export class SalesService {
             discount: totalDiscount,
             total,
             paymentProvider: derivedPaymentProvider,
-            mpesaRef: derivedMpesaRef,
+            mpesaRef: derivedPaymentRef || null,
             notes: finalNotes || null,
             idempotencyKey: createSaleDto.idempotencyKey || null,
             saleItems: { create: saleItems },
@@ -412,9 +314,9 @@ export class SalesService {
         });
 
         // C. Link Matching M-Pesa Transaction if provided
-        if (derivedMpesaRef) {
+        if (derivedPaymentRef) {
           await tx.mpesaTransaction.updateMany({
-            where: { receiptNumber: derivedMpesaRef, saleId: null },
+            where: { receiptNumber: derivedPaymentRef, saleId: null },
             data: { saleId: newSale.id },
           });
         }

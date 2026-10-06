@@ -1,4 +1,4 @@
-import { Controller, Get, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Body, Query, UseGuards } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { ReportsService } from './reports.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
@@ -58,5 +58,42 @@ export class ReportsController {
   @ApiOperation({ summary: 'Get inventory valuation report' })
   async getInventoryValuation() {
     return this.reportsService.getInventoryValuation();
+  }
+
+  @Get('daily/live')
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER, UserRole.BRANCH_MANAGER)
+  @ApiOperation({ summary: 'Get live daily sales report' })
+  async getLiveDailySales(
+    @Query('branchId') branchId?: string,
+    @Query('date') date?: string,
+    @GetUser() user?: any,
+  ) {
+    const targetBranch = user?.role === UserRole.BRANCH_MANAGER ? user.branchId : branchId;
+    return this.reportsService.getLiveDailySales(targetBranch, date);
+  }
+
+  @Post('daily/archive')
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER, UserRole.BRANCH_MANAGER)
+  @ApiOperation({ summary: 'Archive daily sales report' })
+  async archiveDailyReport(
+    @Body('branchId') branchId: string,
+    @Body('date') date?: string,
+    @GetUser() user?: any,
+  ) {
+    const targetBranch = user?.role === UserRole.BRANCH_MANAGER ? user.branchId : branchId;
+    return this.reportsService.archiveDailyReport(targetBranch, date);
+  }
+
+  @Get('daily/archived')
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER, UserRole.BRANCH_MANAGER)
+  @ApiOperation({ summary: 'Get archived daily sales reports' })
+  async getArchivedReports(
+    @Query('branchId') branchId?: string,
+    @Query('startDate') startDate?: string,
+    @Query('endDate') endDate?: string,
+    @GetUser() user?: any,
+  ) {
+    const targetBranch = user?.role === UserRole.BRANCH_MANAGER ? user.branchId : branchId;
+    return this.reportsService.getArchivedReports(targetBranch, startDate, endDate);
   }
 }

@@ -37,22 +37,33 @@ class SaleItemDto {
   serialNumber?: string;
 }
 
-class SalePaymentDto {
-  @ApiProperty({ enum: PaymentProvider })
-  @IsEnum(PaymentProvider)
-  method: PaymentProvider;
+export class SalePaymentDto {
+  @ApiProperty({ enum: ['CASH', 'PAYBILL', 'MPESA'], description: 'Payment method (CASH or PAYBILL)' })
+  @IsNotEmpty()
+  @IsString()
+  method: string;
 
   @ApiProperty({ description: 'Amount for this payment method in KES' })
   @IsNumber()
   @Min(0)
   amount: number;
 
-  @ApiProperty({ required: false, description: 'M-Pesa receipt number (MPESA payments only)' })
+  @ApiProperty({ required: false, description: 'PayBill tracking / reference number' })
+  @IsOptional()
+  @IsString()
+  paymentRef?: string;
+
+  @ApiProperty({ required: false, description: 'Client name for PayBill payment' })
+  @IsOptional()
+  @IsString()
+  customerName?: string;
+
+  @ApiProperty({ required: false, description: 'M-Pesa receipt number (legacy)' })
   @IsOptional()
   @IsString()
   mpesaRef?: string;
 
-  @ApiProperty({ required: false, description: 'Customer phone number for M-Pesa STK push' })
+  @ApiProperty({ required: false, description: 'Customer phone number (legacy)' })
   @IsOptional()
   @IsString()
   phoneNumber?: string;

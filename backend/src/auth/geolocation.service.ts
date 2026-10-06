@@ -161,7 +161,7 @@ export class GeolocationService {
    * Get IP-based location (using ipapi.co or similar)
    * In production, use a proper IP geolocation service
    */
-  async getIpLocation(ipAddress: string): Promise<Partial<GeoLocation> & { city?: string; region?: string; country?: string }> {
+  async getIpLocation(ipAddress: string): Promise<Partial<GeoLocation> & { city?: string; region?: string; country?: string; isp?: string }> {
     try {
       // Skip lookup for private/loopback IPs (common in local dev and some proxies)
       if (
@@ -200,6 +200,7 @@ export class GeolocationService {
         city:      data.city,
         region:    data.region,
         country:   data.country_name,
+        isp:       data.org,
       };
     } catch (error: any) {
       const reason = error.name === 'AbortError' ? 'timeout' : error.message;

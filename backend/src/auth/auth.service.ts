@@ -40,6 +40,72 @@ export class AuthService {
       deviceFingerprint,
     } = loginDto;
 
+    const deviceId = deviceFingerprint || ipAddress || 'unknown';
+    const now = new Date();
+
+    // 0. Check Login Throttling (Requirement 5)
+    const existingAttempt = await this.prisma.loginAttempt.findUnique({
+      where: {
+        email_deviceId: { email, deviceId },
+      },
+    });
+
+    if (existingAttempt?.lockedUntil && existingAttempt.lockedUntil > now) {
+      const remainingSeconds = Math.ceil(
+        (existingAttempt.lockedUntil.getTime() - now.getTime()) / 1000,
+      );
+      const remainingMinutes = Math.ceil(remainingSeconds / 60);
+      throw new ForbiddenException(
+        `Your account/device is locked due to 7 consecutive failed login attempts. Try again in ${remainingMinutes} minute${remainingMinutes > 1 ? 's' : ''} or contact your system administrator for assistance.`,
+      );
+    }
+
+    const handleFailedAttempt = async (foundUser?: any, reason?: string) => {
+      await this.recordFailedLogin(
+        foundUser?.id ?? null,
+        email,
+        ipAddress,
+        userAgent,
+        latitude,
+        longitude,
+        reason || 'Authentication failed',
+      );
+
+      const isLockoutExpired = existingAttempt?.lockedUntil && existingAttempt.lockedUntil <= now;
+      const count = isLockoutExpired ? 1 : (existingAttempt?.attemptCount || 0) + 1;
+      const MAX_ATTEMPTS = 7;
+      const isLocked = count >= MAX_ATTEMPTS;
+      const lockedUntil = isLocked ? new Date(now.getTime() + 10 * 60 * 1000) : null;
+
+      await this.prisma.loginAttempt.upsert({
+        where: { email_deviceId: { email, deviceId } },
+        update: {
+          attemptCount: count,
+          lockedUntil,
+          success: false,
+        },
+        create: {
+          email,
+          deviceId,
+          userId: foundUser?.id ?? null,
+          attemptCount: count,
+          lockedUntil,
+          success: false,
+        },
+      });
+
+      if (isLocked) {
+        throw new ForbiddenException(
+          `Your account/device has been locked for 10 minutes due to 7 consecutive failed login attempts. Please contact your system administrator.`,
+        );
+      }
+
+      const remaining = MAX_ATTEMPTS - count;
+      throw new UnauthorizedException(
+        `Incorrect email or password. ${remaining} attempt${remaining !== 1 ? 's' : ''} remaining before a 10-minute lockout.`,
+      );
+    };
+
     // 1. Find user
     const user = await this.prisma.user.findUnique({
       where: { email },
@@ -55,18 +121,13 @@ export class AuthService {
     }
 
     if (!user) {
-      await this.recordFailedLogin(
-        null, email, ipAddress, userAgent, latitude, longitude, 'User not found',
-      );
+      await handleFailedAttempt(null, 'User not found');
       throw new UnauthorizedException('Incorrect email or password');
     }
 
     // 2. Verify password
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
-      await this.recordFailedLogin(
-        user.id, email, ipAddress, userAgent, latitude, longitude, 'Invalid password',
-      );
       await this.auditLogsService.create({
         action: 'LOGIN',
         entityType: 'USER',
@@ -74,8 +135,14 @@ export class AuthService {
         ipAddress,
         userAgent,
       });
+      await handleFailedAttempt(user, 'Invalid password');
       throw new UnauthorizedException('Incorrect email or password');
     }
+
+    // Clear failed login attempts upon successful password validation
+    await this.prisma.loginAttempt.deleteMany({
+      where: { email, deviceId },
+    }).catch(() => {});
 
     // 3. Check account status
     if (user.status === 'SUSPENDED') {
@@ -95,8 +162,66 @@ export class AuthService {
       throw new ForbiddenException('Account is not active');
     }
 
-    // 4. Device check (skip for SUPER_ADMIN)
-    if (user.role !== 'SUPER_ADMIN') {
+    // 4. Device check & registration
+    if (user.role === 'SUPER_ADMIN') {
+      // Auto-register Super Admin device so it is visible in Device Management
+      if (deviceFingerprint) {
+        let locationCity: string | undefined;
+        let locationRegion: string | undefined;
+        let locationCountry: string | undefined;
+        let locationIsp: string | undefined;
+        let lat = latitude;
+        let lng = longitude;
+        try {
+          const ipLoc = await this.geoService.getIpLocation(ipAddress);
+          locationCity    = ipLoc.city;
+          locationRegion  = ipLoc.region;
+          locationCountry = ipLoc.country;
+          locationIsp     = ipLoc.isp;
+          if (!lat && ipLoc.latitude) lat = ipLoc.latitude;
+          if (!lng && ipLoc.longitude) lng = ipLoc.longitude;
+        } catch (_) {}
+
+        const adminDevice = await this.prisma.device.findFirst({
+          where: { userId: user.id, fingerprint: deviceFingerprint },
+        });
+
+        if (adminDevice) {
+          await this.prisma.device.update({
+            where: { id: adminDevice.id },
+            data: {
+              status: 'APPROVED',
+              lastUsedAt: new Date(),
+              loginIpAddress: ipAddress,
+              loginLatitude:  lat ?? undefined,
+              loginLongitude: lng ?? undefined,
+              loginCity:      locationCity,
+              loginRegion:    locationRegion,
+              loginCountry:   locationCountry,
+              isp:            locationIsp,
+            },
+          });
+        } else {
+          await this.prisma.device.create({
+            data: {
+              userId: user.id,
+              fingerprint: deviceFingerprint,
+              name: `Super Admin Device (${deviceType || 'Browser'})`,
+              status: 'APPROVED',
+              approvedById: user.id,
+              lastUsedAt: new Date(),
+              loginIpAddress: ipAddress,
+              loginLatitude:  lat ?? undefined,
+              loginLongitude: lng ?? undefined,
+              loginCity:      locationCity,
+              loginRegion:    locationRegion,
+              loginCountry:   locationCountry,
+              isp:            locationIsp,
+            },
+          });
+        }
+      }
+    } else {
       // Guard: fingerprint is marked @IsOptional in DTO but is required for the
       // device-auth flow. Any client that omits it gets a clear 400 error instead
       // of a Prisma crash from querying a @unique field with undefined.
@@ -117,11 +242,13 @@ export class AuthService {
         let locationCity: string | undefined;
         let locationRegion: string | undefined;
         let locationCountry: string | undefined;
+        let locationIsp: string | undefined;
         try {
           const ipLoc = await this.geoService.getIpLocation(ipAddress);
           locationCity    = ipLoc.city;
           locationRegion  = ipLoc.region;
           locationCountry = ipLoc.country;
+          locationIsp     = ipLoc.isp;
         } catch (_) {
           // Non-blocking — location display is best-effort
         }
@@ -137,6 +264,7 @@ export class AuthService {
             city:    locationCity,
             region:  locationRegion,
             country: locationCountry,
+            isp:     locationIsp,
           },
         );
 

@@ -176,6 +176,7 @@ enum PaymentProvider {
   CASH
   MPESA
   BANK
+  PAYBILL
 }
 
 enum MovementType {
@@ -255,6 +256,7 @@ model Device {
   loginCity      String?
   loginRegion    String?
   loginCountry   String?
+  isp            String?
 
   lastUsedAt DateTime?
   createdAt  DateTime  @default(now())
@@ -288,6 +290,7 @@ model Branch {
   cylinders           Cylinder[]
 
   closingStockSnapshots ClosingStockSnapshot[] @relation("BranchClosingStock")
+  dailyReports          DailyReport[]          @relation("BranchDailyReports")
 
   isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
@@ -348,6 +351,7 @@ model Product {
   updatedAt DateTime @updatedAt
 
   closingStockSnapshots ClosingStockSnapshot[] @relation("ProductClosingStock")
+  dailySalesItems       DailySalesItem[]
 
   @@map("products")
 }
@@ -461,13 +465,15 @@ model Sale {
 }
 
 model SalePayment {
-  id       String          @id @default(uuid())
-  saleId   String
-  sale     Sale            @relation(fields: [saleId], references: [id], onDelete: Cascade)
-  method   PaymentProvider
-  amount   Decimal         @db.Decimal(10, 2)
-  mpesaRef String?         // receipt number from Safaricom
-  createdAt DateTime       @default(now())
+  id           String          @id @default(uuid())
+  saleId       String
+  sale         Sale            @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  method       PaymentProvider
+  amount       Decimal         @db.Decimal(10, 2)
+  mpesaRef     String?         // receipt number from Safaricom
+  paymentRef   String?         // for PayBill reference/tracking
+  customerName String?         // for PayBill customer name
+  createdAt    DateTime        @default(now())
 
   @@map("sale_payments")
 }
@@ -481,6 +487,9 @@ model SaleItem {
 
   productId String
   product   Product @relation(fields: [productId], references: [id])
+
+  productNameSnapshot String? // Immutable copy of product.name at time of sale
+  variantSnapshot     String? // Immutable copy of LPG variant if applicable
 
   quantity  Int
   unitPrice Decimal @db.Decimal(10, 2)
@@ -956,4 +965,76 @@ model MpesaTransaction {
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 }
+
+model LoginAttempt {
+  id            String    @id @default(uuid())
+  userId        String?
+  deviceId      String
+  email         String
+  success       Boolean   @default(false)
+  attemptCount  Int       @default(1)
+  lastAttemptAt DateTime  @updatedAt
+  lockedUntil   DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@unique([email, deviceId])
+  @@map("login_attempts")
+}
+
+model DailyReport {
+  id                  String           @id @default(uuid())
+  branchId            String
+  branch              Branch           @relation("BranchDailyReports", fields: [branchId], references: [id], onDelete: Cascade)
+  reportDate          DateTime         @db.Date
+  retailSalesTotal    Decimal          @db.Decimal(12, 2) @default(0)
+  retailItemsCount    Int              @default(0)
+  retailDiscountTotal Decimal          @db.Decimal(12, 2) @default(0)
+  wholesaleSalesTotal Decimal          @db.Decimal(12, 2) @default(0)
+  wholesaleItemsCount Int              @default(0)
+  salesItems          DailySalesItem[]
+  expenseTotal        Decimal          @db.Decimal(12, 2) @default(0)
+  expenses            DailyExpense[]
+  grandTotal          Decimal          @db.Decimal(12, 2) @default(0)
+  netTotal            Decimal          @db.Decimal(12, 2) @default(0)
+  isArchived          Boolean          @default(false)
+  archivedAt          DateTime?
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  @@unique([branchId, reportDate])
+  @@map("daily_reports")
+}
+
+model DailySalesItem {
+  id                  String      @id @default(uuid())
+  dailyReportId       String
+  dailyReport         DailyReport @relation(fields: [dailyReportId], references: [id], onDelete: Cascade)
+  productId           String
+  product             Product     @relation(fields: [productId], references: [id])
+  productNameSnapshot String
+  customerName        String?
+  saleType            SaleType
+  markedPrice         Decimal     @db.Decimal(10, 2)
+  sellingPrice        Decimal     @db.Decimal(10, 2)
+  quantity            Int
+  discount            Decimal     @db.Decimal(10, 2) @default(0)
+  subtotal            Decimal     @db.Decimal(12, 2)
+  isRetailSale        Boolean     @default(true)
+  createdAt           DateTime    @default(now())
+
+  @@map("daily_sales_items")
+}
+
+model DailyExpense {
+  id              String      @id @default(uuid())
+  dailyReportId   String
+  dailyReport     DailyReport @relation(fields: [dailyReportId], references: [id], onDelete: Cascade)
+  expenseCategory String
+  amount          Decimal     @db.Decimal(10, 2)
+  description     String?
+  createdAt       DateTime    @default(now())
+
+  @@map("daily_expenses")
+}
+
 
