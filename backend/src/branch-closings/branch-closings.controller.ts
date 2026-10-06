@@ -25,7 +25,7 @@ export class BranchClosingsController {
   }
 
   @Post()
-  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER, UserRole.BRANCH_MANAGER)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER)
   @ApiOperation({ summary: 'Submit end-of-day cash drawer closing count' })
   async submitClosing(
     @Body()
