@@ -1,4 +1,4 @@
-import { IsNotEmpty, IsString, IsOptional, IsEnum, IsNumber, IsArray, ValidateNested, Min } from 'class-validator';
+import { IsNotEmpty, IsString, IsOptional, IsEnum, IsNumber, IsArray, ValidateNested, Min, IsBoolean } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ApiProperty } from '@nestjs/swagger';
 import { SaleType, PaymentProvider, LpgSaleVariant } from '@prisma/client';
@@ -104,7 +104,13 @@ export class CreateSaleDto {
 
   @ApiProperty({ required: false, description: 'True if sale is pending M-Pesa STK push callback' })
   @IsOptional()
+  @IsBoolean()
   isStkPending?: boolean;
+
+  @ApiProperty({ required: false, description: 'Customer phone number for M-Pesa STK push' })
+  @IsOptional()
+  @IsString()
+  phoneNumber?: string;
 
   @ApiProperty({ required: false, description: 'Reason for discounts applied' })
   @IsOptional()
