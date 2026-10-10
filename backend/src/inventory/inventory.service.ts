@@ -611,4 +611,44 @@ export class InventoryService {
       throw error;
     }
   }
+
+  async getHiddenCategories(branchId: string): Promise<string[]> {
+    if (!branchId) return [];
+    const settingKey = `HIDDEN_CATEGORIES_BRANCH_${branchId}`;
+    const setting = await this.prisma.systemSetting.findUnique({
+      where: { key: settingKey },
+    });
+    if (!setting || !setting.value) return [];
+    try {
+      const parsed = JSON.parse(setting.value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+
+  async setHiddenCategories(branchId: string, categoryIds: string[]) {
+    if (!branchId) throw new BadRequestException('Branch ID is required');
+    const settingKey = `HIDDEN_CATEGORIES_BRANCH_${branchId}`;
+    const safeCategoryIds = Array.isArray(categoryIds) ? categoryIds : [];
+
+    await this.prisma.systemSetting.upsert({
+      where: { key: settingKey },
+      update: {
+        value: JSON.stringify(safeCategoryIds),
+        description: `Hidden category IDs for branch ${branchId}`,
+      },
+      create: {
+        key: settingKey,
+        value: JSON.stringify(safeCategoryIds),
+        description: `Hidden category IDs for branch ${branchId}`,
+      },
+    });
+
+    return {
+      branchId,
+      hiddenCategoryIds: safeCategoryIds,
+      success: true,
+    };
+  }
 }
