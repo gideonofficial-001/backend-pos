@@ -3,6 +3,11 @@ import { PrismaService } from '../prisma/prisma.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ExpenseStatus, UserRole } from '@prisma/client';
 import { CreateExpenseDto } from './dto/create-expense.dto';
+import {
+  getNairobiStartOfDay,
+  getNairobiEndOfDay,
+  getNairobiDateString,
+} from '../common/utils/timezone.util';
 
 @Injectable()
 export class ExpensesService {
@@ -86,20 +91,14 @@ export class ExpensesService {
 
   async ensureDailyPettyCash(branchId: string) {
     try {
-      const parts = new Intl.DateTimeFormat('en-CA', {
-        timeZone: 'Africa/Nairobi',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-      }).format(new Date());
-      const [year, month, day] = parts.split('-').map(Number);
-      const today = new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
+      const startOfDay = getNairobiStartOfDay();
+      const endOfDay = getNairobiEndOfDay();
 
       // 1. Check if sales exist today (skip if zero sales)
       const saleCount = await this.prisma.sale.count({
         where: {
           branchId,
-          createdAt: { gte: today },
+          createdAt: { gte: startOfDay, lte: endOfDay },
           status: 'COMPLETED',
         },
       });
@@ -135,12 +134,12 @@ export class ExpensesService {
         where: {
           branchId,
           category: 'PETTY_CASH' as any,
-          createdAt: { gte: today },
+          createdAt: { gte: startOfDay, lte: endOfDay },
         },
       });
 
       if (!existing) {
-        const dateCode = parts.split('-').join('');
+        const dateCode = getNairobiDateString().split('-').join('');
         const codeSuffix = (branch.code || branchId.slice(0, 4)).toUpperCase();
         const expenseCode = `PETTY-${codeSuffix}-${dateCode}`;
 
