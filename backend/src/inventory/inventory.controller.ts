@@ -99,6 +99,27 @@ export class InventoryController {
     return this.inventoryService.getAvailableCylinders(branchId, productId, status);
   }
 
+  @Get('hidden-categories/:branchId')
+  @Roles(
+    UserRole.SUPER_ADMIN,
+    UserRole.OVERALL_MANAGER,
+    UserRole.BRANCH_MANAGER,
+  )
+  @ApiOperation({ summary: 'Get hidden category IDs for a branch' })
+  async getHiddenCategories(@Param('branchId') branchId: string) {
+    return this.inventoryService.getHiddenCategories(branchId);
+  }
+
+  @Post('hidden-categories/:branchId')
+  @Roles(UserRole.SUPER_ADMIN)
+  @ApiOperation({ summary: 'Set hidden category IDs for a branch (Admin only)' })
+  async setHiddenCategories(
+    @Param('branchId') branchId: string,
+    @Body('categoryIds') categoryIds: string[],
+  ) {
+    return this.inventoryService.setHiddenCategories(branchId, categoryIds);
+  }
+
   @Get(':id')
   @Roles(
     UserRole.SUPER_ADMIN,
