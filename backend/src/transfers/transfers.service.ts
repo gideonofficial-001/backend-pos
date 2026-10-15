@@ -371,13 +371,33 @@ export class TransfersService {
     return status;
   }
 
-  private assertIsReceivingManager(transfer: { toBranchId: string }, user: AuthUser) {
-    const canRespond =
-      (user.role === UserRole.BRANCH_MANAGER || user.role === UserRole.SUPER_ADMIN) &&
-      (user.role !== UserRole.BRANCH_MANAGER || user.branchId === transfer.toBranchId);
-    
-    if (!canRespond)
-      throw new ForbiddenException('Only the receiving branch manager or an admin can act on this transfer');
+  private assertIsReceivingManager(
+    transfer: { toBranchId: string; fromBranchId: string; requestedById: string },
+    user: AuthUser,
+  ) {
+    // 1. Strict guard: Outgoing transfers can NEVER be responded to by the sending branch or the requester
+    if (user.branchId && transfer.fromBranchId && user.branchId === transfer.fromBranchId) {
+      throw new ForbiddenException(
+        'The sending branch cannot respond to its own outgoing transfer. You can only cancel it if pending.',
+      );
+    }
+    if (transfer.requestedById && user.userId === transfer.requestedById) {
+      throw new ForbiddenException(
+        'You cannot respond to an outgoing transfer you initiated. You can only cancel it if pending.',
+      );
+    }
+
+    // 2. Only the receiving branch manager or an admin acting for the receiving branch can respond
+    const isAuthorizedRole =
+      user.role === UserRole.BRANCH_MANAGER || user.role === UserRole.SUPER_ADMIN;
+    const isReceivingBranch =
+      !user.branchId || user.branchId === transfer.toBranchId;
+
+    if (!isAuthorizedRole || !isReceivingBranch) {
+      throw new ForbiddenException(
+        'Only the receiving branch manager or an authorized administrator can accept or reject this transfer.',
+      );
+    }
   }
 
   async approveItem(transferId: string, itemId: string, user: AuthUser) {
@@ -541,8 +561,26 @@ export class TransfersService {
       throw new BadRequestException('Cannot cancel — some items have already been accepted or rejected');
     if (transfer.status !== TransferStatus.PENDING)
       throw new BadRequestException(`Transfer is already ${transfer.status.toLowerCase()}`);
-    if (user.role === UserRole.BRANCH_MANAGER && transfer.requestedById !== user.userId)
-      throw new ForbiddenException('Only the manager who created this transfer can cancel it');
+
+    // Strict guard: Incoming transfers can NEVER be cancelled by the receiver.
+    // The receiver can only accept or reject incoming transfers.
+    if (user.branchId && transfer.toBranchId === user.branchId && transfer.fromBranchId !== user.branchId) {
+      throw new ForbiddenException(
+        'Incoming transfers cannot be cancelled. You can only accept or reject incoming transfers.',
+      );
+    }
+
+    // Only the sending branch manager, the user who requested it, or a super admin (from the sending side) can cancel
+    const isRequester = transfer.requestedById === user.userId;
+    const isSendingBranchManager =
+      user.role === UserRole.BRANCH_MANAGER && user.branchId === transfer.fromBranchId;
+    const isSendingAdmin =
+      user.role === UserRole.SUPER_ADMIN &&
+      (!user.branchId || user.branchId === transfer.fromBranchId || isRequester);
+
+    if (!isRequester && !isSendingBranchManager && !isSendingAdmin) {
+      throw new ForbiddenException('Only the sending branch can cancel an outgoing transfer');
+    }
 
     await this.prisma.transfer.update({ where: { id }, data: { status: TransferStatus.CANCELLED } });
 

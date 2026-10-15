@@ -1,12 +1,6 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { UserRole, SaleStatus } from '@prisma/client';
-import {
-  getNairobiStartOfDay,
-  getNairobiEndOfDay,
-  getNairobiDateString,
-  getNairobiCalendarDate,
-} from '../common/utils/timezone.util';
 
 @Injectable()
 export class ReportsService {
@@ -18,8 +12,8 @@ export class ReportsService {
       where.branchId = user.branchId;
     }
 
-    const startOfToday = getNairobiStartOfDay();
-    const endOfToday = getNairobiEndOfDay();
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
 
     const [
       totalSales,
@@ -34,7 +28,7 @@ export class ReportsService {
       todaySalesData,
     ] = await Promise.all([
       this.prisma.sale.count({ where }),
-      this.prisma.sale.count({ where: { ...where, createdAt: { gte: startOfToday, lte: endOfToday } } }),
+      this.prisma.sale.count({ where: { ...where, createdAt: { gte: today } } }),
       this.prisma.sale.aggregate({
         where: { ...where, status: SaleStatus.COMPLETED },
         _sum: { total: true },
@@ -55,7 +49,7 @@ export class ReportsService {
         },
       }),
       this.prisma.sale.findMany({
-        where: { ...where, createdAt: { gte: startOfToday, lte: endOfToday }, status: SaleStatus.COMPLETED },
+        where: { ...where, createdAt: { gte: today }, status: SaleStatus.COMPLETED },
         include: {
           saleItems: {
             include: {
@@ -138,8 +132,9 @@ export class ReportsService {
       where.branchId = user.branchId;
     }
 
-    const startDate = getNairobiStartOfDay();
+    const startDate = new Date();
     startDate.setDate(startDate.getDate() - days);
+    startDate.setHours(0, 0, 0, 0);
 
     const sales = await this.prisma.sale.findMany({
       where: { ...where, createdAt: { gte: startDate } },
@@ -149,7 +144,7 @@ export class ReportsService {
 
     const grouped: Record<string, any> = {};
     sales.forEach((sale) => {
-      const date = getNairobiDateString(sale.createdAt);
+      const date = sale.createdAt.toISOString().split('T')[0];
       if (!grouped[date]) {
         grouped[date] = { date, total: 0, cash: 0, invoice: 0, count: 0 };
       }
@@ -264,9 +259,11 @@ export class ReportsService {
   }
 
   async getLiveDailySales(branchId?: string, dateStr?: string) {
-    const startOfDay = getNairobiStartOfDay(dateStr);
-    const endOfDay = getNairobiEndOfDay(dateStr);
-    const reportDateStr = dateStr || getNairobiDateString();
+    const targetDate = dateStr ? new Date(dateStr) : new Date();
+    const startOfDay = new Date(targetDate);
+    startOfDay.setHours(0, 0, 0, 0);
+    const endOfDay = new Date(targetDate);
+    endOfDay.setHours(23, 59, 59, 999);
 
     const saleWhere: any = {
       status: SaleStatus.COMPLETED,
@@ -371,7 +368,7 @@ export class ReportsService {
     const netTotal = grandTotal - expenseTotal;
 
     return {
-      date: reportDateStr,
+      date: startOfDay.toISOString().split('T')[0],
       branchId: branchId || 'all',
       retailSales: {
         items: retailItems,
@@ -411,7 +408,7 @@ export class ReportsService {
       throw new BadRequestException('Branch ID is required to archive a daily report.');
     }
     const reportData = await this.getLiveDailySales(branchId, dateStr);
-    const reportDate = getNairobiCalendarDate(reportData.date);
+    const reportDate = new Date(reportData.date);
 
     // Delete existing archive for this branch and date if any to refresh cleanly
     await this.prisma.dailyReport.deleteMany({
