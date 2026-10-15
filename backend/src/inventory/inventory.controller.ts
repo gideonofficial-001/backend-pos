@@ -122,6 +122,35 @@ export class InventoryController {
     return this.inventoryService.setHiddenCategories(branchId, categoryIds);
   }
 
+  @Get('branch-prices/:branchId')
+  @Roles(
+    UserRole.SUPER_ADMIN,
+    UserRole.OVERALL_MANAGER,
+    UserRole.BRANCH_MANAGER,
+  )
+  @ApiOperation({ summary: 'Get custom branch price overrides' })
+  async getBranchPrices(@Param('branchId') branchId: string) {
+    return this.inventoryService.getBranchPrices(branchId);
+  }
+
+  @Post('branch-prices/:branchId')
+  @Roles(UserRole.SUPER_ADMIN)
+  @ApiOperation({ summary: 'Set custom branch price for a product (Admin only)' })
+  async setBranchPrice(
+    @Param('branchId') branchId: string,
+    @Body()
+    payload: {
+      productId: string;
+      price?: number;
+      emptyPrice?: number | null;
+      wholesalePrice?: number;
+      wholesaleEmptyPrice?: number | null;
+      resetToGlobal?: boolean;
+    },
+  ) {
+    return this.inventoryService.setBranchPrice(branchId, payload.productId, payload);
+  }
+
   @Get(':id')
   @Roles(
     UserRole.SUPER_ADMIN,

@@ -87,7 +87,58 @@ export class InventoryService {
       }
     }
 
-    return filteredItems.map((item) => this.withComputedEmptyCylinders(item));
+    const branchPriceOverrides = targetBranchId
+      ? await this.getBranchPrices(targetBranchId)
+      : {};
+
+    return filteredItems.map((item) => {
+      const computed = this.withComputedEmptyCylinders(item);
+      const override = branchPriceOverrides[item.productId];
+      const globalPrice = {
+        price: Number(item.product.price),
+        emptyPrice: item.product.emptyPrice != null ? Number(item.product.emptyPrice) : null,
+        wholesalePrice: Number(item.product.wholesalePrice || item.product.price),
+        wholesaleEmptyPrice:
+          item.product.wholesaleEmptyPrice != null
+            ? Number(item.product.wholesaleEmptyPrice)
+            : item.product.emptyPrice != null
+            ? Number(item.product.emptyPrice)
+            : null,
+      };
+
+      if (override) {
+        return {
+          ...computed,
+          isCustomPrice: true,
+          globalPrice,
+          product: {
+            ...computed.product,
+            price:
+              override.price !== undefined && override.price !== null
+                ? override.price
+                : computed.product.price,
+            emptyPrice:
+              override.emptyPrice !== undefined
+                ? override.emptyPrice
+                : computed.product.emptyPrice,
+            wholesalePrice:
+              override.wholesalePrice !== undefined && override.wholesalePrice !== null
+                ? override.wholesalePrice
+                : computed.product.wholesalePrice,
+            wholesaleEmptyPrice:
+              override.wholesaleEmptyPrice !== undefined
+                ? override.wholesaleEmptyPrice
+                : computed.product.wholesaleEmptyPrice,
+          },
+        };
+      }
+
+      return {
+        ...computed,
+        isCustomPrice: false,
+        globalPrice,
+      };
+    });
   }
 
   async findOne(id: string) {
@@ -683,6 +734,89 @@ export class InventoryService {
     return {
       branchId,
       hiddenCategoryIds: safeCategoryIds,
+      success: true,
+    };
+  }
+
+  async getBranchPrices(branchId: string): Promise<Record<string, {
+    price?: number;
+    emptyPrice?: number | null;
+    wholesalePrice?: number;
+    wholesaleEmptyPrice?: number | null;
+  }>> {
+    if (!branchId) return {};
+    const settingKey = `BRANCH_PRICING_${branchId}`;
+    const setting = await this.prisma.systemSetting.findUnique({
+      where: { key: settingKey },
+    });
+    if (!setting || !setting.value) return {};
+    try {
+      const parsed = JSON.parse(setting.value);
+      return typeof parsed === 'object' && parsed !== null ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  async setBranchPrice(
+    branchId: string,
+    productId: string,
+    payload: {
+      price?: number;
+      emptyPrice?: number | null;
+      wholesalePrice?: number;
+      wholesaleEmptyPrice?: number | null;
+      resetToGlobal?: boolean;
+    },
+  ) {
+    if (!branchId) throw new BadRequestException('Branch ID is required');
+    if (!productId) throw new BadRequestException('Product ID is required');
+
+    const settingKey = `BRANCH_PRICING_${branchId}`;
+    const currentPrices = await this.getBranchPrices(branchId);
+
+    if (payload.resetToGlobal) {
+      delete currentPrices[productId];
+    } else {
+      currentPrices[productId] = {
+        price: payload.price !== undefined ? Number(payload.price) : currentPrices[productId]?.price,
+        emptyPrice:
+          payload.emptyPrice !== undefined
+            ? payload.emptyPrice === null
+              ? null
+              : Number(payload.emptyPrice)
+            : currentPrices[productId]?.emptyPrice,
+        wholesalePrice:
+          payload.wholesalePrice !== undefined
+            ? Number(payload.wholesalePrice)
+            : currentPrices[productId]?.wholesalePrice,
+        wholesaleEmptyPrice:
+          payload.wholesaleEmptyPrice !== undefined
+            ? payload.wholesaleEmptyPrice === null
+              ? null
+              : Number(payload.wholesaleEmptyPrice)
+            : currentPrices[productId]?.wholesaleEmptyPrice,
+      };
+    }
+
+    await this.prisma.systemSetting.upsert({
+      where: { key: settingKey },
+      update: {
+        value: JSON.stringify(currentPrices),
+        description: `Custom branch price overrides for branch ${branchId}`,
+      },
+      create: {
+        key: settingKey,
+        value: JSON.stringify(currentPrices),
+        description: `Custom branch price overrides for branch ${branchId}`,
+      },
+    });
+
+    return {
+      branchId,
+      productId,
+      isCustomPrice: !payload.resetToGlobal,
+      prices: currentPrices[productId] || null,
       success: true,
     };
   }

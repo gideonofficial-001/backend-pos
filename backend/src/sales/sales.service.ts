@@ -78,6 +78,19 @@ export class SalesService {
     }
 
     // ── 2. PRE-CALCULATION, PRICING & CYLINDER VALIDATION ───────────────────
+    const branchPricesSetting = await this.prisma.systemSetting.findUnique({
+      where: { key: `BRANCH_PRICING_${branchId}` },
+    });
+    let branchPriceOverrides: Record<string, any> = {};
+    try {
+      if (branchPricesSetting?.value) {
+        const parsed = JSON.parse(branchPricesSetting.value);
+        if (typeof parsed === 'object' && parsed !== null) {
+          branchPriceOverrides = parsed;
+        }
+      }
+    } catch {}
+
     let subtotal = 0;
     let totalDiscount = 0;
     const saleItems: any[] = [];
@@ -91,12 +104,31 @@ export class SalesService {
       }
       const variant = this.resolveVariant(product.type, item.lpgVariant);
 
+      const override = branchPriceOverrides[item.productId];
+
       let basePrice = Number(product.price);
       let emptyPrice = Number(product.emptyPrice || 0);
 
       if (type === SaleType.WHOLESALE) {
         basePrice = Number((product as any).wholesalePrice || product.price);
         emptyPrice = Number((product as any).wholesaleEmptyPrice || product.emptyPrice || 0);
+        if (override) {
+          if (override.wholesalePrice !== undefined && override.wholesalePrice !== null) {
+            basePrice = Number(override.wholesalePrice);
+          }
+          if (override.wholesaleEmptyPrice !== undefined && override.wholesaleEmptyPrice !== null) {
+            emptyPrice = Number(override.wholesaleEmptyPrice);
+          }
+        }
+      } else {
+        if (override) {
+          if (override.price !== undefined && override.price !== null) {
+            basePrice = Number(override.price);
+          }
+          if (override.emptyPrice !== undefined && override.emptyPrice !== null) {
+            emptyPrice = Number(override.emptyPrice);
+          }
+        }
       }
 
       let unitPrice = basePrice;
