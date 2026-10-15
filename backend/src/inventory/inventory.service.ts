@@ -36,10 +36,16 @@ export class InventoryService {
     };
   }
 
-  async findAll(query: { branchId?: string; user?: any; lowStock?: boolean }) {
-    const { branchId, user, lowStock } = query;
+  async findAll(query: {
+    branchId?: string;
+    user?: any;
+    lowStock?: boolean;
+    includeHidden?: boolean;
+  }) {
+    const { branchId, user, lowStock, includeHidden } = query;
     const where: any = {};
 
+    let targetBranchId: string | undefined;
     if (branchId) {
       if (
         user?.role === UserRole.BRANCH_MANAGER &&
@@ -48,8 +54,10 @@ export class InventoryService {
         throw new ForbiddenException('You can only view your branch inventory');
       }
       where.branchId = branchId;
+      targetBranchId = branchId;
     } else if (user?.role === UserRole.BRANCH_MANAGER) {
       where.branchId = user.branchId;
+      targetBranchId = user.branchId;
     }
 
     if (lowStock) where.quantity = { lte: 10 };
@@ -63,7 +71,23 @@ export class InventoryService {
       orderBy: { product: { name: 'asc' } },
     });
 
-    return items.map((item) => this.withComputedEmptyCylinders(item));
+    const isPrivileged =
+      user?.role === UserRole.SUPER_ADMIN || user?.role === UserRole.OVERALL_MANAGER;
+    const shouldIncludeHidden = isPrivileged && !!includeHidden;
+
+    let filteredItems = items;
+    if (targetBranchId && !shouldIncludeHidden) {
+      const hiddenCategoryIds = await this.getHiddenCategories(targetBranchId);
+      if (hiddenCategoryIds.length > 0) {
+        filteredItems = items.filter(
+          (item) =>
+            !item.product?.categoryId ||
+            !hiddenCategoryIds.includes(item.product.categoryId),
+        );
+      }
+    }
+
+    return filteredItems.map((item) => this.withComputedEmptyCylinders(item));
   }
 
   async findOne(id: string) {
@@ -290,7 +314,7 @@ export class InventoryService {
       where.branchId = user.branchId;
     }
 
-    const items = await this.prisma.inventory.findMany({
+    let items = await this.prisma.inventory.findMany({
       where,
       include: {
         product: true,
@@ -298,6 +322,17 @@ export class InventoryService {
       },
       orderBy: { quantity: 'asc' },
     });
+
+    if (user?.role === UserRole.BRANCH_MANAGER && user.branchId) {
+      const hiddenCategoryIds = await this.getHiddenCategories(user.branchId);
+      if (hiddenCategoryIds.length > 0) {
+        items = items.filter(
+          (item) =>
+            !item.product?.categoryId ||
+            !hiddenCategoryIds.includes(item.product.categoryId),
+        );
+      }
+    }
 
     return items.map((item) => this.withComputedEmptyCylinders(item));
   }

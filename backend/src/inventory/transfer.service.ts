@@ -72,6 +72,25 @@ export class TransferService {
         throw new NotFoundException(`Product ${item.productId} not found`);
       }
 
+      if (product.categoryId) {
+        const hiddenSetting = await this.prisma.systemSetting.findUnique({
+          where: { key: `HIDDEN_CATEGORIES_BRANCH_${user.branchId}` },
+        });
+        let hiddenCategoryIds: string[] = [];
+        try {
+          if (hiddenSetting?.value) {
+            const parsed = JSON.parse(hiddenSetting.value);
+            if (Array.isArray(parsed)) hiddenCategoryIds = parsed;
+          }
+        } catch {}
+
+        if (hiddenCategoryIds.includes(product.categoryId)) {
+          throw new BadRequestException(
+            `Product "${product.name}" belongs to a hidden category for your branch and cannot be transferred`,
+          );
+        }
+      }
+
       const inventory = product.inventory[0];
       if (!inventory || inventory.quantity < item.quantity) {
         throw new BadRequestException(

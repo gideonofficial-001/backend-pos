@@ -34,12 +34,14 @@ export class InventoryController {
   async findAll(
     @Query('branchId') branchId?: string,
     @Query('lowStock') lowStock?: string,
+    @Query('includeHidden') includeHidden?: string,
     @GetUser() user?: any,
   ) {
     return this.inventoryService.findAll({
       branchId,
       user,
       lowStock: lowStock === 'true',
+      includeHidden: includeHidden === 'true',
     });
   }
 

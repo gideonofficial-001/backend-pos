@@ -78,6 +78,17 @@ export class TransfersService {
     }
     if (!destBranch.isActive) throw new BadRequestException(`${destBranch.name} is inactive and cannot receive transfers`);
 
+    const hiddenSetting = await this.prisma.systemSetting.findUnique({
+      where: { key: `HIDDEN_CATEGORIES_BRANCH_${fromBranchId}` },
+    });
+    let hiddenCategoryIds: string[] = [];
+    try {
+      if (hiddenSetting?.value) {
+        const parsed = JSON.parse(hiddenSetting.value);
+        if (Array.isArray(parsed)) hiddenCategoryIds = parsed;
+      }
+    } catch {}
+
     const transferItems: { productId: string; quantity: number; lpgComponent?: LpgComponent }[] = [];
 
     for (const item of items) {
@@ -90,6 +101,12 @@ export class TransfersService {
       });
 
       if (!inventory) throw new BadRequestException(`Product not found in source branch inventory`);
+
+      if (inventory.product.categoryId && hiddenCategoryIds.includes(inventory.product.categoryId)) {
+        throw new BadRequestException(
+          `Product "${inventory.product.name}" belongs to a hidden category for this branch and cannot be transferred`,
+        );
+      }
 
       const variant = item.variant ?? 'STANDARD';
       const isLpg = isProductLpg(inventory.product) || inventory.fullCylinders != null;

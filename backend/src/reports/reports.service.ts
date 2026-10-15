@@ -21,6 +21,38 @@ export class ReportsService {
     const startOfToday = getNairobiStartOfDay();
     const endOfToday = getNairobiEndOfDay();
 
+    let hiddenCategoryIds: string[] = [];
+    if (user?.role === UserRole.BRANCH_MANAGER && user.branchId) {
+      const hiddenSetting = await this.prisma.systemSetting.findUnique({
+        where: { key: `HIDDEN_CATEGORIES_BRANCH_${user.branchId}` },
+      });
+      try {
+        if (hiddenSetting?.value) {
+          const parsed = JSON.parse(hiddenSetting.value);
+          if (Array.isArray(parsed)) hiddenCategoryIds = parsed;
+        }
+      } catch {}
+    }
+
+    const lowStockWhere: any = { quantity: { lte: 10 } };
+    const productWhere: any = { isActive: true };
+
+    if (user?.role === UserRole.BRANCH_MANAGER && user.branchId) {
+      lowStockWhere.branchId = user.branchId;
+      if (hiddenCategoryIds.length > 0) {
+        lowStockWhere.product = {
+          OR: [
+            { categoryId: null },
+            { categoryId: { notIn: hiddenCategoryIds } },
+          ],
+        };
+        productWhere.OR = [
+          { categoryId: null },
+          { categoryId: { notIn: hiddenCategoryIds } },
+        ];
+      }
+    }
+
     const [
       totalSales,
       todaySales,
@@ -40,9 +72,9 @@ export class ReportsService {
         _sum: { total: true },
       }),
       this.prisma.branch.count(),
-      this.prisma.product.count({ where: { isActive: true } }),
+      this.prisma.product.count({ where: productWhere }),
       this.prisma.user.count(),
-      this.prisma.inventory.count({ where: { quantity: { lte: 10 } } }),
+      this.prisma.inventory.count({ where: lowStockWhere }),
       this.prisma.invoice.count({ where: { status: { in: ['PENDING', 'SENT'] } } }),
       this.prisma.sale.findMany({
         where,
