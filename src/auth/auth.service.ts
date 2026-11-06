@@ -404,7 +404,7 @@ export class AuthService {
     );
 
     if (!result.valid) {
-      throw new BadRequestException('Invalid or expired authorization code');
+      throw new BadRequestException(result.message || 'Invalid or expired authorization code');
     }
 
     const user = await this.prisma.user.findUnique({

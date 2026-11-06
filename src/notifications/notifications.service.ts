@@ -110,33 +110,49 @@ export class NotificationsService {
   // ── Pending approvals (existing, unchanged) ───────────────────────────────
 
   async getPendingApprovals(userId?: string, userRole?: UserRole) {
-    // For transfers: only count ones relevant to the user's branch.
-    // SUPER_ADMIN and BRANCH_MANAGER only see transfers involving their branch.
-    // Returns, devices, expenses are admin-wide concerns.
+    // Scope approvals based on branch assignment:
+    // Branch managers (and branch-assigned admins) only count items for their branch.
+    // Global admins (SUPER_ADMIN without branchId) see all approvals.
     let transferWhere: any = { status: 'PENDING' };
+    let returnWhere: any = { status: 'PENDING' };
+    let expenseWhere: any = { status: 'PENDING' };
 
     if (userId) {
       const user = await this.prisma.user.findUnique({
         where: { id: userId },
-        select: { branchId: true },
+        select: { branchId: true, role: true },
       });
       if (user?.branchId) {
-        transferWhere = {
-          status: 'PENDING',
-          OR: [
-            { fromBranchId: user.branchId },
-            { toBranchId: user.branchId },
-          ],
-        };
+        const isGlobalAdmin =
+          (user.role === UserRole.SUPER_ADMIN || user.role === UserRole.OVERALL_MANAGER) &&
+          !user.branchId;
+
+        if (!isGlobalAdmin) {
+          transferWhere = {
+            status: 'PENDING',
+            OR: [
+              { fromBranchId: user.branchId },
+              { toBranchId: user.branchId },
+            ],
+          };
+          returnWhere = {
+            status: 'PENDING',
+            branchId: user.branchId,
+          };
+          expenseWhere = {
+            status: 'PENDING',
+            branchId: user.branchId,
+          };
+        }
       }
     }
 
     const [pendingReturns, pendingDevices, pendingTransfers, pendingExpenses] =
       await Promise.all([
-        this.prisma.return.count({ where: { status: 'PENDING' } }),
+        this.prisma.return.count({ where: returnWhere }),
         this.prisma.device.count({ where: { status: 'PENDING' } }),
         this.prisma.transfer.count({ where: transferWhere }),
-        this.prisma.expense.count({ where: { status: 'PENDING' } }),
+        this.prisma.expense.count({ where: expenseWhere }),
       ]);
 
     return {

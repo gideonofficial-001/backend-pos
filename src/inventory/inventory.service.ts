@@ -420,15 +420,27 @@ export class InventoryService {
     });
   }
 
-  async getStockAdjustments(params: {
-    branchId?: string;
-    startDate?: string;
-    endDate?: string;
-    search?: string;
-  }) {
+  async getStockAdjustments(
+    params: {
+      branchId?: string;
+      startDate?: string;
+      endDate?: string;
+      search?: string;
+    },
+    user?: any,
+  ) {
     const where: any = {};
 
-    if (params.branchId && params.branchId !== 'all') {
+    // Branch managers (and users scoped to a branch) only see adjustments for their own branch
+    if (user?.role === UserRole.BRANCH_MANAGER && user.branchId) {
+      where.inventory = { branchId: user.branchId };
+    } else if (
+      user?.branchId &&
+      user.role !== UserRole.SUPER_ADMIN &&
+      user.role !== UserRole.OVERALL_MANAGER
+    ) {
+      where.inventory = { branchId: user.branchId };
+    } else if (params.branchId && params.branchId !== 'all') {
       where.inventory = { branchId: params.branchId };
     }
 

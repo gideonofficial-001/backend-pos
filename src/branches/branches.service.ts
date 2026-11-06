@@ -167,29 +167,11 @@ export class BranchesService {
     const branch = await this.prisma.branch.findUnique({ where: { id } });
     if (!branch) throw new NotFoundException('Branch not found');
 
-    const hiddenSetting = await this.prisma.systemSetting.findUnique({
-      where: { key: `HIDDEN_CATEGORIES_BRANCH_${id}` },
-    });
-    let hiddenCategoryIds: string[] = [];
-    try {
-      if (hiddenSetting?.value) {
-        const parsed = JSON.parse(hiddenSetting.value);
-        if (Array.isArray(parsed)) hiddenCategoryIds = parsed;
-      }
-    } catch {}
-
-    const items = await this.prisma.inventory.findMany({
+    return this.prisma.inventory.findMany({
       where: { branchId: id },
       include: { product: { include: { category: true } } },
       orderBy: { product: { name: 'asc' } },
     });
-
-    if (hiddenCategoryIds.length > 0) {
-      return items.filter(
-        (item) => !item.product?.categoryId || !hiddenCategoryIds.includes(item.product.categoryId),
-      );
-    }
-    return items;
   }
 
   async getBranchSales(id: string, startDate?: string, endDate?: string) {

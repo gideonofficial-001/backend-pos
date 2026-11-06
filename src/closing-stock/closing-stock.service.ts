@@ -84,30 +84,13 @@ export class ClosingStockService {
       include: { product: true },
     });
 
-    const hiddenSetting = await this.prisma.systemSetting.findUnique({
-      where: { key: `HIDDEN_CATEGORIES_BRANCH_${branchId}` },
-    });
-    let hiddenCategoryIds: string[] = [];
-    try {
-      if (hiddenSetting?.value) {
-        const parsed = JSON.parse(hiddenSetting.value);
-        if (Array.isArray(parsed)) hiddenCategoryIds = parsed;
-      }
-    } catch {}
-
-    const eligibleInventory = hiddenCategoryIds.length > 0
-      ? inventory.filter(
-          (inv) => !inv.product?.categoryId || !hiddenCategoryIds.includes(inv.product.categoryId),
-        )
-      : inventory;
-
-    if (!eligibleInventory.length) {
-      this.logger.log(`No active visible inventory found for branch ${branchId}`);
+    if (!inventory.length) {
+      this.logger.log(`No active inventory found for branch ${branchId}`);
       return 0;
     }
 
     await this.prisma.$transaction(
-      eligibleInventory.map((inv) =>
+      inventory.map((inv) =>
         this.prisma.closingStockSnapshot.create({
           data: {
             branchId,
@@ -122,7 +105,7 @@ export class ClosingStockService {
       ),
     );
 
-    return eligibleInventory.length;
+    return inventory.length;
   }
 
   // ── Helper: Concluded Business Date ───────────────────────────────────────
@@ -184,30 +167,9 @@ export class ClosingStockService {
       throw new NotFoundException('No closing stock record found for this date');
     }
 
-    const hiddenSetting = await this.prisma.systemSetting.findUnique({
-      where: { key: `HIDDEN_CATEGORIES_BRANCH_${branchId}` },
-    });
-    let hiddenCategoryIds: string[] = [];
-    try {
-      if (hiddenSetting?.value) {
-        const parsed = JSON.parse(hiddenSetting.value);
-        if (Array.isArray(parsed)) hiddenCategoryIds = parsed;
-      }
-    } catch {}
-
-    const visibleSnapshots = hiddenCategoryIds.length > 0
-      ? snapshots.filter(
-          (snap) => !snap.product.categoryId || !hiddenCategoryIds.includes(snap.product.categoryId),
-        )
-      : snapshots;
-
-    if (!visibleSnapshots.length) {
-      throw new NotFoundException('No visible closing stock records found for this date');
-    }
-
     // Group by category
     const categoryMap = new Map<string, any>();
-    visibleSnapshots.forEach((snap) => {
+    snapshots.forEach((snap) => {
       const catId = snap.product.category?.id || 'uncategorized';
       const catName = snap.product.category?.name || 'Uncategorized';
 
@@ -238,8 +200,8 @@ export class ClosingStockService {
       branchId,
       branchName: branch?.name || '',
       date: dateOnly,
-      recordedAt: visibleSnapshots[0].recordedAt,
-      totalProducts: visibleSnapshots.length,
+      recordedAt: snapshots[0].recordedAt,
+      totalProducts: snapshots.length,
       categories: Array.from(categoryMap.values()),
     };
   }

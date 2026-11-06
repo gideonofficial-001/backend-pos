@@ -1,24 +1,23 @@
 import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import {
-  getNairobiCalendarDate,
-  getNairobiStartOfDay,
-  getNairobiEndOfDay,
-  getNairobiDateString,
-} from '../common/utils/timezone.util';
 
 @Injectable()
 export class BranchClosingsService {
   constructor(private prisma: PrismaService) {}
 
   private getTodayDate(): Date {
-    return getNairobiCalendarDate();
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Africa/Nairobi',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date());
+    const [year, month, day] = parts.split('-').map(Number);
+    return new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
   }
 
   async getTodaySummary(branchId: string) {
     const today = this.getTodayDate();
-    const startOfDay = getNairobiStartOfDay();
-    const endOfDay = getNairobiEndOfDay();
 
     // Check existing record
     const existing = await this.prisma.branchClosing.findUnique({
@@ -34,7 +33,7 @@ export class BranchClosingsService {
     // This accurately includes cash from today's cash sales AND cash received on invoice debt payments today!
     const paymentsToday = await this.prisma.salePayment.findMany({
       where: {
-        createdAt: { gte: startOfDay, lte: endOfDay },
+        createdAt: { gte: today },
         sale: { branchId, status: 'COMPLETED' },
       },
       select: { method: true, amount: true, saleId: true },
@@ -46,7 +45,7 @@ export class BranchClosingsService {
     for (const p of paymentsToday) {
       if (p.method === 'CASH') {
         cashSales += Number(p.amount);
-      } else if (p.method === 'MPESA' || p.method === 'PAYBILL') {
+      } else if (p.method === 'MPESA') {
         mpesaSales += Number(p.amount);
       }
     }
@@ -55,7 +54,7 @@ export class BranchClosingsService {
     const legacySales = await this.prisma.sale.findMany({
       where: {
         branchId,
-        createdAt: { gte: startOfDay, lte: endOfDay },
+        createdAt: { gte: today },
         status: 'COMPLETED',
         type: { not: 'INVOICE' },
         payments: { none: {} },
@@ -64,7 +63,7 @@ export class BranchClosingsService {
     });
 
     for (const s of legacySales) {
-      if (s.paymentProvider === 'MPESA' || s.paymentProvider === 'PAYBILL') {
+      if (s.paymentProvider === 'MPESA') {
         mpesaSales += Number(s.total);
       } else if (s.paymentProvider === 'CASH') {
         cashSales += Number(s.total);
@@ -76,7 +75,7 @@ export class BranchClosingsService {
       where: {
         branchId,
         type: 'INVOICE',
-        createdAt: { gte: startOfDay, lte: endOfDay },
+        createdAt: { gte: today },
         status: 'COMPLETED',
       },
       select: { total: true },
@@ -123,12 +122,18 @@ export class BranchClosingsService {
           where: {
             branchId,
             category: 'PETTY_CASH',
-            createdAt: { gte: startOfDay, lte: endOfDay },
+            createdAt: { gte: today },
           },
         });
 
         if (!existingPettyExpense) {
-          const dateCode = getNairobiDateString().split('-').join('');
+          const parts = new Intl.DateTimeFormat('en-CA', {
+            timeZone: 'Africa/Nairobi',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+          }).format(new Date());
+          const dateCode = parts.split('-').join('');
           const codeSuffix = (branch?.code || branchId.slice(0, 4)).toUpperCase();
           const expenseCode = `PETTY-${codeSuffix}-${dateCode}`;
 
@@ -157,7 +162,7 @@ export class BranchClosingsService {
     const approvedExpenses = await this.prisma.expense.findMany({
       where: {
         branchId,
-        createdAt: { gte: startOfDay, lte: endOfDay },
+        createdAt: { gte: today },
         status: 'APPROVED',
         category: { not: 'PETTY_CASH' },
       },
@@ -169,7 +174,7 @@ export class BranchClosingsService {
     const refunds = await this.prisma.return.findMany({
       where: {
         branchId,
-        approvedAt: { gte: startOfDay, lte: endOfDay },
+        approvedAt: { gte: today },
         status: 'APPROVED',
       },
     });
