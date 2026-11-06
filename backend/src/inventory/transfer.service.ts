@@ -72,6 +72,25 @@ export class TransferService {
         throw new NotFoundException(`Product ${item.productId} not found`);
       }
 
+      if (product.categoryId) {
+        const hiddenSetting = await this.prisma.systemSetting.findUnique({
+          where: { key: `HIDDEN_CATEGORIES_BRANCH_${user.branchId}` },
+        });
+        let hiddenCategoryIds: string[] = [];
+        try {
+          if (hiddenSetting?.value) {
+            const parsed = JSON.parse(hiddenSetting.value);
+            if (Array.isArray(parsed)) hiddenCategoryIds = parsed;
+          }
+        } catch {}
+
+        if (hiddenCategoryIds.includes(product.categoryId)) {
+          throw new BadRequestException(
+            `Product "${product.name}" belongs to a hidden category for your branch and cannot be transferred`,
+          );
+        }
+      }
+
       const inventory = product.inventory[0];
       if (!inventory || inventory.quantity < item.quantity) {
         throw new BadRequestException(
@@ -243,6 +262,18 @@ export class TransferService {
 
     if (!transfer) throw new NotFoundException('Transfer not found');
 
+    // Strictly prevent sender/creator from responding to outgoing transfers
+    if (user.branchId && transfer.fromBranchId === user.branchId) {
+      throw new ForbiddenException(
+        'The sending branch cannot respond to its own outgoing transfer. You can only cancel it if pending.',
+      );
+    }
+    if (transfer.requestedById === userId) {
+      throw new ForbiddenException(
+        'You cannot respond to an outgoing transfer you initiated. You can only cancel it if pending.',
+      );
+    }
+
     // Only the RECEIVING branch manager (or SUPER_ADMIN at their branch) can respond
     const isAuthorisedResponder =
       (user.role === UserRole.BRANCH_MANAGER || user.role === UserRole.SUPER_ADMIN) &&
@@ -372,12 +403,23 @@ export class TransferService {
 
     if (!transfer) throw new NotFoundException('Transfer not found');
 
-    // Only the sender (or super admin) can cancel
-    if (
-      transfer.requestedById !== userId &&
-      user?.role !== UserRole.SUPER_ADMIN
-    ) {
-      throw new ForbiddenException('Only the creator can cancel this transfer');
+    // Strict guard: Incoming transfers can NEVER be cancelled by the receiver.
+    if (user.branchId && transfer.toBranchId === user.branchId && transfer.fromBranchId !== user.branchId) {
+      throw new ForbiddenException(
+        'Incoming transfers cannot be cancelled. You can only accept or reject incoming transfers.',
+      );
+    }
+
+    // Only the creator or the sending branch can cancel
+    const isRequester = transfer.requestedById === userId;
+    const isSendingBranchManager =
+      user.role === UserRole.BRANCH_MANAGER && user.branchId === transfer.fromBranchId;
+    const isSendingAdmin =
+      user.role === UserRole.SUPER_ADMIN &&
+      (!user.branchId || user.branchId === transfer.fromBranchId || isRequester);
+
+    if (!isRequester && !isSendingBranchManager && !isSendingAdmin) {
+      throw new ForbiddenException('Only the creator or sending branch can cancel this transfer');
     }
 
     const anyAccepted = transfer.items.some((i) => i.status === 'ACCEPTED');

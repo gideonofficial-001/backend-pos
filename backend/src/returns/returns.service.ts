@@ -66,15 +66,9 @@ export class ReturnsService {
       },
     });
 
-    // Notify only relevant admins — global super admins or admins assigned to this branch — NOT the submitter.
+    // Notify all admins who need to action the return — NOT the submitter.
     const admins = await this.prisma.user.findMany({
-      where: {
-        role: UserRole.SUPER_ADMIN,
-        OR: [
-          { branchId: null },
-          { branchId: sale.branchId },
-        ],
-      },
+      where: { role: UserRole.SUPER_ADMIN },
       select: { id: true },
     });
     await Promise.all(
@@ -108,17 +102,7 @@ export class ReturnsService {
   async findAll(query?: { branchId?: string; status?: string; user?: any }) {
     const where: any = {};
     if (query?.status) where.status = query.status;
-
-    // Strict branch isolation:
-    // If caller is BRANCH_MANAGER, force where.branchId to their branch.
-    // If caller has branchId and is not global SUPER_ADMIN / OVERALL_MANAGER, scope to their branch.
-    if (query?.user?.role === UserRole.BRANCH_MANAGER && query.user.branchId) {
-      where.branchId = query.user.branchId;
-    } else if (query?.user?.branchId && query.user.role !== UserRole.SUPER_ADMIN && query.user.role !== UserRole.OVERALL_MANAGER) {
-      where.branchId = query.user.branchId;
-    } else if (query?.branchId) {
-      where.branchId = query.branchId;
-    }
+    if (query?.branchId) where.branchId = query.branchId;
 
     return this.prisma.return.findMany({
       where,

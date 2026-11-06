@@ -70,24 +70,20 @@ export class InventoryController {
   }
 
   @Get('adjustments')
-  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER, UserRole.BRANCH_MANAGER)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER)
   @ApiOperation({ summary: 'Get manual stock adjustments' })
   async getStockAdjustments(
     @Query('branchId') branchId?: string,
     @Query('startDate') startDate?: string,
     @Query('endDate') endDate?: string,
     @Query('search') search?: string,
-    @GetUser() user?: any,
   ) {
-    return this.inventoryService.getStockAdjustments(
-      {
-        branchId,
-        startDate,
-        endDate,
-        search,
-      },
-      user,
-    );
+    return this.inventoryService.getStockAdjustments({
+      branchId,
+      startDate,
+      endDate,
+      search,
+    });
   }
 
   @Get('cylinders/available')

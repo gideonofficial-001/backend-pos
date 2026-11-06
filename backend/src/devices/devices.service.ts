@@ -21,59 +21,6 @@ export class DevicesService {
     private notificationsService: NotificationsService,
   ) {}
 
-  parseDeviceDetails(userAgent?: string): {
-    deviceType: 'Desktop' | 'Mobile' | 'Tablet';
-    deviceName: string;
-  } {
-    if (!userAgent) {
-      return { deviceType: 'Desktop', deviceName: 'Unknown Device' };
-    }
-
-    const ua = userAgent;
-
-    // 1. Determine Device Type
-    let deviceType: 'Desktop' | 'Mobile' | 'Tablet' = 'Desktop';
-    if (/iPad|Tablet|PlayBook|Silk/i.test(ua)) {
-      deviceType = 'Tablet';
-    } else if (/Mobi|Android|iPhone|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua)) {
-      deviceType = 'Mobile';
-    }
-
-    // 2. Determine OS & Model
-    let os = 'Unknown OS';
-    let model = '';
-
-    if (/Windows NT 10\.0/i.test(ua)) os = 'Windows 10/11 PC';
-    else if (/Windows NT/i.test(ua)) os = 'Windows PC';
-    else if (/Macintosh|Mac OS X/i.test(ua) && !/iPhone|iPad/i.test(ua)) os = 'Mac';
-    else if (/iPhone/i.test(ua)) os = 'iPhone';
-    else if (/iPad/i.test(ua)) os = 'iPad';
-    else if (/Android/i.test(ua)) {
-      os = 'Android';
-      const match = ua.match(/Android\s+[\d\.]+;\s*([^;)]+)/i);
-      if (match && match[1]) {
-        const candidate = match[1].replace(/Build\/[^\s;)]+/i, '').trim();
-        if (candidate && candidate.length < 35 && !/khtml/i.test(candidate)) {
-          model = candidate;
-        }
-      }
-    } else if (/Linux/i.test(ua)) {
-      os = 'Linux PC';
-    }
-
-    // 3. Determine Browser
-    let browser = 'Browser';
-    if (/Edg\//i.test(ua)) browser = 'Edge';
-    else if (/Chrome\//i.test(ua) && !/Edg\//i.test(ua)) browser = 'Chrome';
-    else if (/Safari\//i.test(ua) && !/Chrome\//i.test(ua)) browser = 'Safari';
-    else if (/Firefox\//i.test(ua)) browser = 'Firefox';
-    else if (/Opera|OPR\//i.test(ua)) browser = 'Opera';
-
-    const deviceName = model ? `${os} (${model}) · ${browser}` : `${os} · ${browser}`;
-
-    return { deviceType, deviceName };
-  }
-
   private getMailTransporter() {
     return nodemailer.createTransport({
       service: 'gmail',
@@ -132,14 +79,11 @@ export class DevicesService {
     // NOTE: The strict 1-device limit is removed so the PWA and new browsers
     // can successfully request access and go into the PENDING state for the Admin to review.
 
-    const { deviceType, deviceName } = this.parseDeviceDetails(deviceInfo.userAgent);
-    const friendlyName = `${deviceType}: ${deviceName}`;
-
     const device = await this.prisma.device.create({
       data: {
         userId,
         fingerprint,
-        name: friendlyName,
+        name: deviceInfo.userAgent?.substring(0, 100) || 'Unknown device',
         status: DeviceStatus.PENDING,
         loginIpAddress: deviceInfo.ipAddress ?? null,
         loginLatitude:  deviceInfo.latitude  ?? null,
@@ -154,7 +98,7 @@ export class DevicesService {
     await this.auditLogsService.create({
       userId,
       action: 'DEVICE_REGISTERED',
-      description: `New device registered for user ${userId} (${friendlyName})`,
+      description: `New device registered for user ${userId}`,
       entityType: 'Device',
       entityId: device.id,
       ipAddress: deviceInfo.ipAddress,
@@ -182,10 +126,8 @@ export class DevicesService {
       deviceInfo.country,
     ].filter(Boolean);
     const locationStr = locationParts.length > 0
-      ? `from ${locationParts.join(', ')}`
-      : deviceInfo.ipAddress ? `from IP ${deviceInfo.ipAddress}` : 'from unknown location';
-
-    const notifMessage = `${userName} (${branchName}) is requesting authorization to log in ${locationStr} on a ${deviceType} (${deviceName}). Generate code in Device Management.`;
+      ? ` from ${locationParts.join(', ')}`
+      : '';
 
     const admins = await this.prisma.user.findMany({
       where: { role: UserRole.SUPER_ADMIN },
@@ -203,7 +145,7 @@ export class DevicesService {
             this.notificationsService.create({
               type: 'DEVICE_AUTH',
               title: 'New Device Login Request',
-              message: notifMessage,
+              message: `${userName} (${branchName}) is trying to log in${locationStr} on a new device. Approve or reject in Device Management.`,
               userId: admin.id,
               entityId: device.id,
               entityType: 'Device',
@@ -233,11 +175,10 @@ export class DevicesService {
     const hashedCode = await bcrypt.hash(code, 10);
     const expiry = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes
 
-    // Device remains PENDING until the user successfully verifies the OTP!
     await this.prisma.device.update({
       where: { id: deviceId },
       data: {
-        status: DeviceStatus.PENDING,
+        status: DeviceStatus.APPROVED,
         approvedById,
         requestCode: hashedCode,
         requestCodeExpiry: expiry,
@@ -262,8 +203,8 @@ export class DevicesService {
           subject: 'Device Authorization Code - Njugush POS',
           html: `
             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-              <h2 style="color: #2563eb;">Device Authorization Code</h2>
-              <p>An authorization code has been generated for your device. Enter this code to complete login:</p>
+              <h2 style="color: #2563eb;">Device Authorization</h2>
+              <p>Your device has been approved. Use the code below to complete login:</p>
               <div style="background: #f3f4f6; padding: 20px; text-align: center; border-radius: 8px; margin: 20px 0;">
                 <h1 style="letter-spacing: 12px; color: #2563eb; font-size: 36px; margin: 0;">${code}</h1>
               </div>
@@ -286,8 +227,8 @@ export class DevicesService {
     try {
       await this.auditLogsService.create({
         userId: approvedById ?? undefined,
-        action: 'DEVICE_CODE_GENERATED',
-        description: `Authorization code generated for device ${deviceId} (user: ${device.user.email})`,
+        action: 'DEVICE_APPROVED',
+        description: `Device ${deviceId} approved for user ${device.user.email}${emailSent ? ' — code emailed' : ' — code not emailed'}`,
         entityType: 'Device',
         entityId: deviceId,
       });
@@ -297,8 +238,8 @@ export class DevicesService {
 
     return {
       message: emailSent
-        ? 'Authorization code generated and emailed to user'
-        : 'Authorization code generated — share the code with the user',
+        ? 'Device approved — authorization code sent to user email (in background)'
+        : 'Device approved — email not sent, use the code below',
       code,
       emailSent,
       emailError,
@@ -312,40 +253,29 @@ export class DevicesService {
       where: { id: requestId },
     });
 
-    if (!device) {
-      return { valid: false, message: 'Device authorization request not found' };
+    if (!device || device.status !== DeviceStatus.APPROVED) {
+      return { valid: false, message: 'Device not approved' };
     }
 
     if (!device.requestCode) {
-      return {
-        valid: false,
-        message: 'No authorization code generated yet. Please ask your administrator to generate a code.',
-      };
+      return { valid: false, message: 'No authorization code found' };
     }
 
     if (
       device.requestCodeExpiry &&
       device.requestCodeExpiry < new Date()
     ) {
-      return {
-        valid: false,
-        message: 'Authorization code has expired. Please ask your administrator for a new code.',
-      };
+      return { valid: false, message: 'Authorization code has expired' };
     }
 
     const isValid = await bcrypt.compare(code, device.requestCode);
     if (!isValid) {
-      return { valid: false, message: 'Invalid authorization code. Please check and try again.' };
+      return { valid: false, message: 'Invalid authorization code' };
     }
 
-    // Mark as APPROVED ONLY upon successful OTP verification!
     await this.prisma.device.update({
       where: { id: requestId },
-      data: {
-        status: DeviceStatus.APPROVED,
-        requestCode: null,
-        requestCodeExpiry: null,
-      },
+      data: { requestCode: null, requestCodeExpiry: null },
     });
 
     return { valid: true, userId: device.userId };
