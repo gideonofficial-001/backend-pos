@@ -216,12 +216,23 @@ export class ReportsService {
     }));
   }
 
-  async getProductPerformance() {
+  async getProductPerformance(user?: any) {
+    const branchId = user?.role === UserRole.BRANCH_MANAGER ? user.branchId : undefined;
     const products = await this.prisma.product.findMany({
       where: { isActive: true },
       include: {
-        saleItems: { select: { quantity: true, total: true } },
-        inventory: true,
+        saleItems: branchId
+          ? {
+              where: { sale: { branchId, status: SaleStatus.COMPLETED } },
+              select: { quantity: true, total: true },
+            }
+          : {
+              where: { sale: { status: SaleStatus.COMPLETED } },
+              select: { quantity: true, total: true },
+            },
+        inventory: branchId
+          ? { where: { branchId } }
+          : true,
       },
     });
 
@@ -240,8 +251,11 @@ export class ReportsService {
     }));
   }
 
-  async getExpenseReport(startDate?: string, endDate?: string) {
+  async getExpenseReport(startDate?: string, endDate?: string, user?: any) {
     const where: any = {};
+    if (user?.role === UserRole.BRANCH_MANAGER && user.branchId) {
+      where.branchId = user.branchId;
+    }
     if (startDate && endDate) {
       where.createdAt = { gte: new Date(startDate), lte: new Date(endDate) };
     }
@@ -269,8 +283,10 @@ export class ReportsService {
     };
   }
 
-  async getInventoryValuation() {
+  async getInventoryValuation(user?: any) {
+    const branchId = user?.role === UserRole.BRANCH_MANAGER ? user.branchId : undefined;
     const inventory = await this.prisma.inventory.findMany({
+      where: branchId ? { branchId } : {},
       include: { product: true, branch: { select: { name: true } } },
     });
 

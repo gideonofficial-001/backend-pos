@@ -37,27 +37,28 @@ export class ReportsController {
   }
 
   @Get('product-performance')
-  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER, UserRole.BRANCH_MANAGER)
   @ApiOperation({ summary: 'Get product performance report' })
-  async getProductPerformance() {
-    return this.reportsService.getProductPerformance();
+  async getProductPerformance(@GetUser() user?: any) {
+    return this.reportsService.getProductPerformance(user);
   }
 
   @Get('expenses')
-  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER, UserRole.BRANCH_MANAGER)
   @ApiOperation({ summary: 'Get expense report' })
   async getExpenseReport(
     @Query('startDate') startDate?: string,
     @Query('endDate') endDate?: string,
+    @GetUser() user?: any,
   ) {
-    return this.reportsService.getExpenseReport(startDate, endDate);
+    return this.reportsService.getExpenseReport(startDate, endDate, user);
   }
 
   @Get('inventory-valuation')
-  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OVERALL_MANAGER, UserRole.BRANCH_MANAGER)
   @ApiOperation({ summary: 'Get inventory valuation report' })
-  async getInventoryValuation() {
-    return this.reportsService.getInventoryValuation();
+  async getInventoryValuation(@GetUser() user?: any) {
+    return this.reportsService.getInventoryValuation(user);
   }
 
   @Get('daily/live')
