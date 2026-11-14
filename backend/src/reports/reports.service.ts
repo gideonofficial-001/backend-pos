@@ -329,6 +329,7 @@ export class ReportsService {
       include: {
         customer: true,
         branch: { select: { id: true, name: true } },
+        payments: true,
         saleItems: {
           include: {
             product: true,
@@ -349,9 +350,35 @@ export class ReportsService {
     let wholesaleDiscountTotal = 0;
     let wholesaleItemsCount = 0;
 
+    let paybillTotal = 0;
+    let cashSalesTotal = 0;
+
     for (const sale of sales) {
       const isRetail = sale.type === 'CASH';
       const isWholesale = sale.type === 'WHOLESALE';
+
+      // Payment breakdown (Cash vs Paybill / M-Pesa)
+      if (sale.type !== 'INVOICE') {
+        if (sale.payments && sale.payments.length > 0) {
+          for (const p of sale.payments) {
+            const method = String(p.method).toUpperCase();
+            if (method === 'PAYBILL' || method === 'MPESA' || method === 'BANK') {
+              paybillTotal += Number(p.amount || 0);
+            } else if (method === 'CASH') {
+              cashSalesTotal += Number(p.amount || 0);
+            } else {
+              paybillTotal += Number(p.amount || 0);
+            }
+          }
+        } else {
+          const prov = String(sale.paymentProvider).toUpperCase();
+          if (prov === 'PAYBILL' || prov === 'MPESA' || prov === 'BANK') {
+            paybillTotal += Number(sale.total || 0);
+          } else {
+            cashSalesTotal += Number(sale.total || 0);
+          }
+        }
+      }
 
       for (const item of sale.saleItems) {
         const qty = item.quantity;
@@ -413,10 +440,46 @@ export class ReportsService {
       },
     });
 
-    const expenseTotal = expenses.reduce((sum, e) => sum + Number(e.amount), 0);
+    // Check if petty cash is in expenses or configured on branch/manager
+    let pettyCashTotal = expenses
+      .filter((e) => e.category === 'PETTY_CASH')
+      .reduce((sum, e) => sum + Number(e.amount), 0);
+
+    if (pettyCashTotal === 0 && sales.length > 0 && branchId && branchId !== 'all') {
+      const branch = await this.prisma.branch.findUnique({
+        where: { id: branchId },
+        include: {
+          manager: true,
+          users: { where: { status: 'ACTIVE' } },
+        },
+      });
+
+      if (branch?.manager && Number(branch.manager.dailyPettyCash || 0) > 0) {
+        pettyCashTotal = Number(branch.manager.dailyPettyCash);
+      } else if (branch?.users && branch.users.length > 0) {
+        const mgr =
+          branch.users.find(
+            (u) => u.role === 'BRANCH_MANAGER' && Number(u.dailyPettyCash || 0) > 0,
+          ) || branch.users.find((u) => Number(u.dailyPettyCash || 0) > 0);
+        if (mgr) {
+          pettyCashTotal = Number(mgr.dailyPettyCash || 0);
+        }
+      }
+    }
+
+    const regularExpenseTotal = expenses
+      .filter((e) => e.category !== 'PETTY_CASH')
+      .reduce((sum, e) => sum + Number(e.amount), 0);
+
+    const totalExpensesInclusive = regularExpenseTotal + pettyCashTotal;
+    const netSales = retailTotal + wholesaleTotal;
+    const difference1 = netSales - paybillTotal;
+    const difference2 = difference1 - totalExpensesInclusive;
+    const amountToBeSubmittedCash = difference2;
+
     const grandTotal = retailTotal + wholesaleTotal;
     const totalDiscount = retailDiscountTotal + wholesaleDiscountTotal;
-    const netTotal = grandTotal - expenseTotal;
+    const netTotal = grandTotal - totalExpensesInclusive;
 
     return {
       date: reportDateStr,
@@ -441,15 +504,25 @@ export class ReportsService {
           description: e.description,
           branchName: e.branch?.name,
         })),
-        total: expenseTotal,
+        total: totalExpensesInclusive,
+        regularTotal: regularExpenseTotal,
+        pettyCashTotal,
       },
       summary: {
         retailTotal,
         wholesaleTotal,
         totalDiscount,
         grandTotal,
-        expenseTotal,
-        netTotal,
+        netSales,
+        paybillTotal: Math.round(paybillTotal * 100) / 100,
+        cashSalesTotal: Math.round(cashSalesTotal * 100) / 100,
+        difference1: Math.round(difference1 * 100) / 100,
+        expenseTotal: Math.round(totalExpensesInclusive * 100) / 100,
+        regularExpenseTotal: Math.round(regularExpenseTotal * 100) / 100,
+        pettyCashTotal: Math.round(pettyCashTotal * 100) / 100,
+        difference2: Math.round(difference2 * 100) / 100,
+        amountToBeSubmittedCash: Math.round(amountToBeSubmittedCash * 100) / 100,
+        netTotal: Math.round(netTotal * 100) / 100,
       },
     };
   }
